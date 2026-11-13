@@ -32,14 +32,16 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Search for tracks (or artist top-tracks with -a)
+    /// Search tracks, albums (-A), or artist top tracks (-a)
     Search {
         #[arg(help = "Search query, e.g. \"Netsky\" or \"Chase The Sun\"")]
         query: Option<String>,
-        #[arg(short = 'n', long, default_value_t = 10, help = "Number of results")]
+        #[arg(short = 'n', long, default_value_t = 10, value_parser = clap::value_parser!(u32).range(1..=100), help = "Number of results (1-100)")]
         limit: u32,
         #[arg(short, long, help = "Search by artist and show their top tracks")]
         artist: bool,
+        #[arg(short = 'A', long, conflicts_with = "artist", help = "Search albums and browse their tracks")]
+        album: bool,
     },
     /// Browse and play curated Tidal mixes
     Mix {
@@ -83,7 +85,7 @@ fn main() -> Result<()> {
     match cli.command {
         None => interactive_menu(),
 
-        Some(Commands::Search { query, limit, artist }) => {
+        Some(Commands::Search { query, limit, artist, album }) => {
             let query = query.unwrap_or_else(|| {
                 Cli::command()
                     .find_subcommand_mut("search")
@@ -96,7 +98,11 @@ fn main() -> Result<()> {
             });
             let session = auth::get_session()?;
             let mut client = api::TidalClient::new(session);
-            search::run(&mut client, &query, limit, artist)
+            if album {
+                library::search_albums(&mut client, &query, limit)
+            } else {
+                search::run(&mut client, &query, limit, artist)
+            }
         }
 
         Some(Commands::Mix { debug }) => {
@@ -300,7 +306,7 @@ fn interactive_menu() -> Result<()> {
                 if !query.trim().is_empty() {
                     let session = auth::get_session()?;
                     let mut client = api::TidalClient::new(session);
-                    search::run(&mut client, &query, 10, false)?;
+                    interactive_search(&mut client, &query)?;
                 }
             }
             Some(1) => {
@@ -333,7 +339,7 @@ fn interactive_menu() -> Result<()> {
                         if !query.trim().is_empty() {
                             let session = auth::get_session()?;
                             let mut client = api::TidalClient::new(session);
-                            search::run(&mut client, &query, 10, false)?;
+                            interactive_search(&mut client, &query)?;
                         }
                     }
                     _ => {}
@@ -355,5 +361,21 @@ fn interactive_menu() -> Result<()> {
             }
             _ => {}
         }
+    }
+}
+
+fn interactive_search(client: &mut api::TidalClient, query: &str) -> Result<()> {
+    let choice = dialoguer::Select::new()
+        .with_prompt("Search for")
+        .items(&["Tracks", "Albums", "Artists"])
+        .default(0)
+        .report(false)
+        .interact_opt()?;
+    let limit = config::load().search_limit.clamp(1, 100);
+    match choice {
+        Some(1) => library::search_albums(client, query.trim(), limit),
+        Some(0) => search::run(client, query.trim(), limit, false),
+        Some(2) => search::run(client, query.trim(), limit, true),
+        _ => Ok(()),
     }
 }

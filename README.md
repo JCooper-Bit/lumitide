@@ -30,7 +30,7 @@ Stream audio from your Tidal account directly in the terminal, with album art, a
 - **Mix mode** — browse and play your curated Tidal mixes with animated track transitions
 - **Playlist mode** — browse and play your Tidal playlists
 - **Radio** — press `r` on any track to start a Tidal radio seeded from it
-- **Search** — find tracks by title or artist
+- **Search** — find tracks, albums, or artists; browse album tracks, play results in sequence, or queue an album for download
 - **Local playback** — shuffle local FLAC, MP3, and M4A files with the same UI
 - **Download** — press `d` while a track is playing to save it to disk; or press `d` on any album, mix, playlist, or track in a list view to queue it for **background download** without interrupting playback or navigation
 - **Download queue** — a live `⬇ Artist - Title  N / M` indicator appears at the bottom-right of every screen while the queue is running; total grows as you queue more
@@ -155,11 +155,19 @@ CLI usage is also fully supported:
 ```sh
 lumitide search "Netsky"               # search tracks by title
 lumitide search "Chase The Sun" -n 20  # increase result count
+lumitide search "Discovery" --album    # browse album results and their tracks
+lumitide search "Daft Punk" --artist   # select an artist and play top tracks
 lumitide mix                           # browse and play your Tidal mixes
 lumitide library                       # browse liked tracks, saved albums, followed artists
 lumitide local                         # shuffle local audio files
 lumitide config                        # open the config file in your editor
 ```
+
+Choose **Tracks**, **Albums**, or **Artists** after entering a query in the interactive Search menu.
+Album results support typing to filter, `Enter` to browse tracks, and `d` to download the album.
+Track results support `Enter` to play from the selection, next/previous during playback, and `d` to download a track.
+`Esc` returns to the previous list. Use `-A` / `--album` or `-a` / `--artist` on the CLI (mutually exclusive); `-n` accepts 1–100 results.
+The interactive menu uses the configured `search_limit`.
 
 ## Key Bindings
 

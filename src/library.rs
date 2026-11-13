@@ -525,6 +525,33 @@ fn liked_tracks(client: &mut TidalClient, debug: bool) -> Result<()> {
     Ok(())
 }
 
+/// Browse catalog album results with the same filtering and download controls as the library.
+pub fn search_albums(client: &mut TidalClient, query: &str, limit: u32) -> Result<()> {
+    let mut items = client.search_albums(query, limit)?;
+    let mut labels = items.iter().map(|a| format!("{} — {}", a.title, a.artist_name)).collect();
+    let (tx, rx) = mpsc::channel();
+    drop(tx);
+    loop {
+        match fuzzy_select(
+            "Albums (type to filter)", "No albums found. Press any key to go back.",
+            &mut items, &mut labels, &rx,
+            &|a: &crate::api::AlbumInfo| format!("{} — {}", a.title, a.artist_name), true,
+        )? {
+            None => return Ok(()),
+            Some(FuzzyAction::Queue(idx)) => {
+                let tracks = client.album_tracks(items[idx].id)?;
+                if let Some(queue) = crate::DOWNLOAD_QUEUE.get() {
+                    queue.push_tracks(tracks, client.session.clone(), config::load().output_path());
+                }
+            }
+            Some(FuzzyAction::Select(idx, _)) => {
+                let tracks = client.album_tracks(items[idx].id)?;
+                crate::search::browse_tracks(client, &tracks)?;
+            }
+        }
+    }
+}
+
 fn saved_albums(client: &mut TidalClient, debug: bool) -> Result<()> {
     let rx = spawn_paginated(client.session.clone(), |c, o, l| c.favorite_albums_page(o, l));
     let mut items: Vec<crate::api::AlbumInfo> = Vec::new();

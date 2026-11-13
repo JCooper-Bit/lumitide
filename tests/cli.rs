@@ -43,7 +43,10 @@ fn search_no_query_error_mentions_search() {
 #[test]
 fn search_invalid_limit_exits_nonzero() {
     // Clap rejects a non-integer for -n before any auth happens
-    let out = lumitide().args(["search", "test", "-n", "notanumber"]).output().unwrap();
+    let out = lumitide()
+        .args(["search", "test", "-n", "notanumber"])
+        .output()
+        .unwrap();
     assert!(!out.status.success());
 }
 
@@ -59,4 +62,29 @@ fn library_help_exits_zero() {
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("library") || stdout.contains("Browse"));
+}
+
+#[test]
+fn search_album_help_and_conflicts() {
+    let out = lumitide().args(["search", "--help"]).output().unwrap();
+    let help = String::from_utf8_lossy(&out.stdout);
+    assert!(help.contains("--album"));
+    let out = lumitide()
+        .args(["search", "test", "--album", "--artist"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("cannot be used with"));
+}
+
+#[test]
+fn search_limit_must_be_in_range() {
+    for limit in ["0", "101"] {
+        let out = lumitide()
+            .args(["search", "test", "-n", limit])
+            .output()
+            .unwrap();
+        assert!(!out.status.success());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("invalid value"));
+    }
 }

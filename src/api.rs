@@ -67,6 +67,38 @@ pub struct AlbumInfo {
     pub cover: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct AlbumSearchResponse {
+    albums: Option<AlbumSearchItems>,
+}
+
+#[derive(Deserialize)]
+struct AlbumSearchItems {
+    items: Vec<SearchAlbum>,
+}
+
+#[derive(Deserialize)]
+struct SearchAlbum {
+    id: u64,
+    title: String,
+    artist: Option<RawArtist>,
+    #[serde(default)]
+    artists: Vec<RawArtist>,
+    cover: Option<String>,
+}
+
+impl From<SearchAlbum> for AlbumInfo {
+    fn from(album: SearchAlbum) -> Self {
+        Self {
+            id: album.id,
+            title: album.title,
+            artist_name: album.artist.or_else(|| album.artists.into_iter().next())
+                .map(|a| a.name).unwrap_or_default(),
+            cover: album.cover,
+        }
+    }
+}
+
 // ─── Raw API deserialization ───────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -261,6 +293,19 @@ impl TidalClient {
         ])?;
         let data: SearchResp = resp.json()?;
         Ok(data.tracks.map(|t| t.items.into_iter().map(Into::into).collect())
+            .unwrap_or_default())
+    }
+
+    pub fn search_albums(&self, query: &str, limit: u32) -> Result<Vec<AlbumInfo>> {
+        let limit_s = limit.to_string();
+        let resp = self.get("search", &[
+            ("query", query),
+            ("limit", &limit_s),
+            ("types", "ALBUMS"),
+            ("countryCode", &self.session.country_code),
+        ])?;
+        let data: AlbumSearchResponse = resp.json()?;
+        Ok(data.albums.map(|a| a.items.into_iter().map(Into::into).collect())
             .unwrap_or_default())
     }
 
@@ -582,6 +627,24 @@ fn decrypt_security_token(key_id: &str) -> Result<EncryptionInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn album_search_parses_metadata_and_artist_fallback() {
+        let response: AlbumSearchResponse = serde_json::from_str(r#"{"albums":{"items":[
+            {"id":1,"title":"Discovery","artist":{"id":2,"name":"Daft Punk"},"cover":"abc"},
+            {"id":3,"title":"Other","artists":[{"id":4,"name":"Guest"}]},
+            {"id":5,"title":"Minimal"}
+        ]}}"#).unwrap();
+        let albums: Vec<AlbumInfo> = response.albums.unwrap().items.into_iter().map(Into::into).collect();
+        assert_eq!(albums[0].id, 1);
+        assert_eq!(albums[0].title, "Discovery");
+        assert_eq!(albums[0].artist_name, "Daft Punk");
+        assert_eq!(albums[0].cover.as_deref(), Some("abc"));
+        assert_eq!(albums[1].artist_name, "Guest");
+        assert!(albums[2].artist_name.is_empty());
+        let empty: AlbumSearchResponse = serde_json::from_str("{}").unwrap();
+        assert!(empty.albums.is_none());
+    }
 
     fn parse(json: &str) -> TrackInfo {
         serde_json::from_str::<RawTrack>(json).unwrap().into()

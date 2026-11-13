@@ -6,7 +6,10 @@ use std::time::Duration;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{
+        disable_raw_mode, enable_raw_mode, Clear, ClearType, EnterAlternateScreen,
+        LeaveAlternateScreen,
+    },
 };
 use ratatui::{
     backend::CrosstermBackend,
@@ -17,17 +20,20 @@ use ratatui::{
     Terminal,
 };
 
-use crate::api::TidalClient;
+use crate::api::{TidalClient, TrackInfo};
 use crate::config;
 use crate::preview;
 use crate::radio;
 use crate::utils::is_saved;
+use std::sync::{Arc, Mutex};
 
-enum Action { Play(usize), Queue(usize), Back }
+enum Action {
+    Play(usize),
+    Queue(usize),
+    Back,
+}
 
 pub fn run(client: &mut TidalClient, query: &str, limit: u32, by_artist: bool) -> Result<()> {
-    let cfg = config::load();
-
     let tracks = if by_artist {
         let artists = client.search_artists(query)?;
         if artists.is_empty() {
@@ -38,12 +44,15 @@ pub fn run(client: &mut TidalClient, query: &str, limit: u32, by_artist: bool) -
             artists.into_iter().next().unwrap()
         } else {
             let names: Vec<&str> = artists.iter().map(|a| a.name.as_str()).collect();
-            let idx = Select::new()
+            let Some(idx) = Select::new()
                 .with_prompt("Which artist?")
                 .items(&names)
                 .default(0)
                 .report(false)
-                .interact()?;
+                .interact_opt()?
+            else {
+                return Ok(());
+            };
             artists.into_iter().nth(idx).unwrap()
         };
         client.artist_top_tracks(artist.id, limit)?
@@ -51,6 +60,12 @@ pub fn run(client: &mut TidalClient, query: &str, limit: u32, by_artist: bool) -
         client.search_tracks(query, limit)?
     };
 
+    browse_tracks(client, &tracks)
+}
+
+pub fn browse_tracks(client: &mut TidalClient, tracks: &[TrackInfo]) -> Result<()> {
+    let cfg = config::load();
+    let volume = Arc::new(Mutex::new(cfg.volume));
     if tracks.is_empty() {
         println!("No results found.");
         return Ok(());
@@ -72,88 +87,134 @@ pub fn run(client: &mut TidalClient, query: &str, limit: u32, by_artist: bool) -
             execute!(stdout, Clear(ClearType::All), EnterAlternateScreen)?;
             Terminal::new(CrosstermBackend::new(stdout))?
         };
-        while event::poll(Duration::ZERO)? {
-            let _ = event::read();
-        }
+        let action = (|| -> Result<Action> {
+            while event::poll(Duration::ZERO)? {
+                let _ = event::read();
+            }
 
-        let action = loop {
-            terminal.draw(|f| {
-                let area = f.area();
-                let visible = area.height as usize;
+            loop {
+                terminal.draw(|f| {
+                    let area = f.area();
+                    let visible = area.height as usize;
 
-                if cursor < scroll { scroll = cursor; }
-                if visible > 0 && cursor >= scroll + visible { scroll = cursor + 1 - visible; }
+                    if cursor < scroll {
+                        scroll = cursor;
+                    }
+                    if visible > 0 && cursor >= scroll + visible {
+                        scroll = cursor + 1 - visible;
+                    }
 
-                let items: Vec<ListItem> = labels
-                    .iter()
-                    .enumerate()
-                    .skip(scroll)
-                    .take(visible)
-                    .map(|(i, label)| {
-                        if i == cursor {
-                            ListItem::new(Line::from(format!("> {}", label)))
-                                .style(Style::default().add_modifier(Modifier::BOLD))
-                        } else {
-                            ListItem::new(format!("  {}", label))
+                    let items: Vec<ListItem> = labels
+                        .iter()
+                        .enumerate()
+                        .skip(scroll)
+                        .take(visible)
+                        .map(|(i, label)| {
+                            if i == cursor {
+                                ListItem::new(Line::from(format!("> {}", label)))
+                                    .style(Style::default().add_modifier(Modifier::BOLD))
+                            } else {
+                                ListItem::new(format!("  {}", label))
+                            }
+                        })
+                        .collect();
+                    f.render_widget(List::new(items), area);
+
+                    if let Some(txt) = crate::DOWNLOAD_QUEUE
+                        .get()
+                        .and_then(|q| q.status())
+                        .or_else(|| show_hint.then(|| " ↵ play  d · download ".to_string()))
+                    {
+                        let w = txt.chars().count() as u16;
+                        let qs_area = Rect::new(
+                            area.width.saturating_sub(w),
+                            area.height.saturating_sub(1),
+                            w.min(area.width),
+                            1,
+                        );
+                        f.render_widget(
+                            Paragraph::new(txt).style(Style::default().add_modifier(Modifier::DIM)),
+                            qs_area,
+                        );
+                    }
+                })?;
+
+                if event::poll(Duration::from_millis(100))? {
+                    if let Event::Key(key) = event::read()? {
+                        if key.kind != KeyEventKind::Press {
+                            continue;
                         }
-                    })
-                    .collect();
-                f.render_widget(List::new(items), area);
-
-                if let Some(txt) = crate::DOWNLOAD_QUEUE
-                    .get()
-                    .and_then(|q| q.status())
-                    .or_else(|| show_hint.then(|| " ↵ play  d · download ".to_string()))
-                {
-                    let w = txt.chars().count() as u16;
-                    let qs_area = Rect::new(
-                        area.width.saturating_sub(w),
-                        area.height.saturating_sub(1),
-                        w.min(area.width),
-                        1,
-                    );
-                    f.render_widget(
-                        Paragraph::new(txt).style(Style::default().add_modifier(Modifier::DIM)),
-                        qs_area,
-                    );
-                }
-            })?;
-
-            if event::poll(Duration::from_millis(100))? {
-                if let Event::Key(key) = event::read()? {
-                    if key.kind != KeyEventKind::Press { continue; }
-                    match key.code {
-                        KeyCode::Up | KeyCode::Char('k') => { if cursor > 0 { cursor -= 1; } }
-                        KeyCode::Down | KeyCode::Char('j') => { if cursor + 1 < tracks.len() { cursor += 1; } }
-                        KeyCode::Enter => break Action::Play(cursor),
-                        KeyCode::Char('d') | KeyCode::Char('D') => break Action::Queue(cursor),
-                        KeyCode::Esc | KeyCode::Char('q') => break Action::Back,
-                        _ => {}
+                        match key.code {
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                if cursor > 0 {
+                                    cursor -= 1;
+                                }
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                if cursor + 1 < tracks.len() {
+                                    cursor += 1;
+                                }
+                            }
+                            KeyCode::Enter => return Ok(Action::Play(cursor)),
+                            KeyCode::Char('d') | KeyCode::Char('D') => {
+                                return Ok(Action::Queue(cursor))
+                            }
+                            KeyCode::Esc | KeyCode::Char('q') => return Ok(Action::Back),
+                            _ => {}
+                        }
                     }
                 }
             }
-        };
+        })();
 
         let _ = disable_raw_mode();
         let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
         drop(terminal);
 
-        match action {
+        match action? {
             Action::Back => return Ok(()),
             Action::Queue(idx) => {
                 if let Some(queue) = crate::DOWNLOAD_QUEUE.get() {
-                    queue.push_tracks(vec![tracks[idx].clone()], client.session.clone(), cfg.output_path());
+                    queue.push_tracks(
+                        vec![tracks[idx].clone()],
+                        client.session.clone(),
+                        cfg.output_path(),
+                    );
                 }
             }
             Action::Play(idx) => {
-                let track = &tracks[idx];
-                let saved = is_saved(&cfg.output_path(), &track.artist_name, &track.title);
-                let result = preview::run(client, track.id, false, None, None, saved, None)?;
-                if result.starts_with("radio:") {
-                    if let Ok(id) = result["radio:".len()..].parse::<u64>() {
-                        radio::run(client, id, false)?;
+                let mut pos = idx;
+                let mut direction = None;
+                while pos < tracks.len() {
+                    let track = &tracks[pos];
+                    let saved = is_saved(&cfg.output_path(), &track.artist_name, &track.title);
+                    let label = format!("{} / {}", pos + 1, tracks.len());
+                    let result = preview::run(
+                        client,
+                        track.id,
+                        false,
+                        Some(label),
+                        Some(volume.clone()),
+                        saved,
+                        direction,
+                    )?;
+                    match result.as_str() {
+                        "quit" => break,
+                        "prev" => {
+                            pos = pos.saturating_sub(1);
+                            direction = Some("prev");
+                        }
+                        r if r.starts_with("radio:") => {
+                            if let Ok(id) = r["radio:".len()..].parse::<u64>() {
+                                radio::run(client, id, false)?;
+                            }
+                            break;
+                        }
+                        _ => {
+                            pos += 1;
+                            direction = Some("next");
+                        }
                     }
-                    return Ok(());
                 }
             }
         }
