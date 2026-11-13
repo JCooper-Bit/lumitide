@@ -416,3 +416,19 @@ fn open_browser(url: &str) {
     #[cfg(target_os = "linux")]
     let _ = std::process::Command::new("xdg-open").arg(url).spawn();
 }
+
+/// Refresh without starting a login flow. Serialisation also prevents workers from
+/// rotating the same refresh token concurrently.
+pub fn refreshed_session(session:&Session)->Result<Session>{
+    if !session.is_expired(){return Ok(session.clone());}
+    static LOCK:std::sync::OnceLock<std::sync::Mutex<()>>=std::sync::OnceLock::new();
+    let _lock=LOCK.get_or_init(||std::sync::Mutex::new(())).lock().unwrap();
+    if let Ok(bytes)=std::fs::read(session_path()){
+        if let Ok(saved)=serde_json::from_slice::<Session>(&bytes){
+            if saved.user_id==session.user_id&&!saved.is_expired(){return Ok(saved);}
+        }
+    }
+    let updated=refresh_token(&session.refresh_token)?;
+    save_session(&updated)?;
+    Ok(updated)
+}

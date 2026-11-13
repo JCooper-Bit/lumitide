@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
 use base64::Engine;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::auth::Session;
 
@@ -21,7 +21,7 @@ pub struct StreamInfo {
     pub encryption: Option<EncryptionInfo>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(dead_code)] // audio_quality and duration stored for metadata embedding / future display
 pub struct TrackInfo {
     pub id: u64,
@@ -92,11 +92,37 @@ impl From<SearchAlbum> for AlbumInfo {
         Self {
             id: album.id,
             title: album.title,
-            artist_name: album.artist.or_else(|| album.artists.into_iter().next())
-                .map(|a| a.name).unwrap_or_default(),
+            artist_name: album
+                .artist
+                .or_else(|| album.artists.into_iter().next())
+                .map(|a| a.name)
+                .unwrap_or_default(),
             cover: album.cover,
         }
     }
+}
+
+#[derive(Deserialize)]
+struct ApiPage<T> {
+    items: Vec<T>,
+    #[serde(rename = "totalNumberOfItems")]
+    total: Option<usize>,
+}
+#[derive(Deserialize)]
+struct RawListItem {
+    #[serde(rename = "type")]
+    item_type: String,
+    item: serde_json::Value,
+}
+#[derive(Deserialize)]
+struct RawPlaylist {
+    uuid: String,
+    title: String,
+}
+#[derive(Clone)]
+pub struct PlaylistEntry {
+    pub index: usize,
+    pub track: TrackInfo,
 }
 
 // ─── Raw API deserialization ───────────────────────────────────────────────────
@@ -138,31 +164,44 @@ struct RawTrack {
 
 impl From<RawTrack> for TrackInfo {
     fn from(r: RawTrack) -> Self {
-        let year = r.album.release_date.as_deref().and_then(|d| {
-            d.split('-').next().and_then(|y| y.parse().ok())
-        });
+        let year = r
+            .album
+            .release_date
+            .as_deref()
+            .and_then(|d| d.split('-').next().and_then(|y| y.parse().ok()));
         // Prefer the single artist field; fall back to first element of artists array
-        let primary_artist = r.artist
+        let primary_artist = r
+            .artist
             .as_ref()
             .map(|a| a.name.clone())
-            .or_else(|| r.artists.as_ref().and_then(|v| v.first()).map(|a| a.name.clone()))
+            .or_else(|| {
+                r.artists
+                    .as_ref()
+                    .and_then(|v| v.first())
+                    .map(|a| a.name.clone())
+            })
             .unwrap_or_default();
         let copyright = r.copyright.or(r.album.copyright);
         TrackInfo {
-            id:                  r.id,
-            title:               r.title,
-            artist_name:         primary_artist.clone(),
-            album_name:          r.album.title,
-            album_cover:         r.album.cover,
-            album_artist:        r.album.artist.map(|a| a.name).unwrap_or(primary_artist),
-            album_copyright:     copyright,
-            album_release_year:  year,
-            artists:             r.artists.unwrap_or_default().into_iter().map(|a| a.name).collect(),
-            track_num:           r.track_number.unwrap_or(1),
-            volume_num:          r.volume_number.unwrap_or(1),
-            isrc:                r.isrc,
-            audio_quality:       r.audio_quality.unwrap_or_else(|| "UNKNOWN".to_string()),
-            duration:            r.duration.unwrap_or(0),
+            id: r.id,
+            title: r.title,
+            artist_name: primary_artist.clone(),
+            album_name: r.album.title,
+            album_cover: r.album.cover,
+            album_artist: r.album.artist.map(|a| a.name).unwrap_or(primary_artist),
+            album_copyright: copyright,
+            album_release_year: year,
+            artists: r
+                .artists
+                .unwrap_or_default()
+                .into_iter()
+                .map(|a| a.name)
+                .collect(),
+            track_num: r.track_number.unwrap_or(1),
+            volume_num: r.volume_number.unwrap_or(1),
+            isrc: r.isrc,
+            audio_quality: r.audio_quality.unwrap_or_else(|| "UNKNOWN".to_string()),
+            duration: r.duration.unwrap_or(0),
         }
     }
 }
@@ -172,20 +211,35 @@ impl From<RawTrack> for TrackInfo {
 pub struct TidalClient {
     pub session: Session,
     client: reqwest::blocking::Client,
+    base_url: String,
 }
 
 impl TidalClient {
+    #[cfg(test)]
+    pub fn with_test_url(session: Session, base_url: String) -> Self {
+        let mut c = Self::new(session);
+        c.base_url = base_url;
+        c
+    }
     pub fn new(session: Session) -> Self {
         let client = reqwest::blocking::Client::builder()
             .user_agent(crate::auth::TIDAL_UA)
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(30))
             .build()
             .unwrap_or_default();
-        Self { session, client }
+        Self {
+            session,
+            client,
+            base_url: API_BASE.into(),
+        }
     }
 
     fn get(&self, path: &str, params: &[(&str, &str)]) -> Result<reqwest::blocking::Response> {
-        let url = format!("{}/{}", API_BASE, path);
-        let mut req = self.client.get(&url)
+        let url = format!("{}/{}", self.base_url, path);
+        let mut req = self
+            .client
+            .get(&url)
             .header("Authorization", self.session.auth_header());
         for &(k, v) in params {
             req = req.query(&[(k, v)]);
@@ -197,6 +251,209 @@ impl TidalClient {
             return Err(anyhow!("API error {} on {}: {}", status, path, body));
         }
         Ok(resp)
+    }
+
+    fn all<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        params: &[(&str, &str)],
+    ) -> Result<Vec<T>> {
+        let mut offset = 0usize;
+        let mut items = Vec::new();
+        loop {
+            let offset_s = offset.to_string();
+            let mut query = params.to_vec();
+            query.extend([
+                ("limit", "100"),
+                ("offset", &offset_s),
+                ("countryCode", &self.session.country_code),
+            ]);
+            let data: ApiPage<T> = self.get(path, &query)?.json()?;
+            let count = data.items.len();
+            items.extend(data.items);
+            offset += count;
+            if count == 0
+                || data.total.is_some_and(|n| offset >= n)
+                || (data.total.is_none() && count < 100)
+            {
+                break;
+            }
+        }
+        Ok(items)
+    }
+
+    fn write(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        form: &[(&str, String)],
+        etag: Option<&str>,
+    ) -> Result<reqwest::blocking::Response> {
+        let mut request = self
+            .client
+            .request(method, format!("{}/{}", self.base_url, path))
+            .header("Authorization", self.session.auth_header())
+            .query(&[("countryCode", &self.session.country_code)])
+            .form(form);
+        if let Some(etag) = etag {
+            request = request.header("If-None-Match", etag);
+        }
+        let response = request.send()?;
+        if !response.status().is_success() {
+            let code = response.status();
+            if code == reqwest::StatusCode::PRECONDITION_FAILED {
+                anyhow::bail!("Playlist changed elsewhere. Reload it before editing.");
+            }
+            anyhow::bail!("Tidal rejected the change ({code}): {}", response.text()?);
+        }
+        Ok(response)
+    }
+
+    pub fn set_favorite(&self, kind: &str, id: u64, enabled: bool) -> Result<()> {
+        let field = match kind {
+            "tracks" => "trackIds",
+            "albums" => "albumIds",
+            "artists" => "artistIds",
+            _ => anyhow::bail!("Invalid favorite type"),
+        };
+        let path = format!("users/{}/favorites/{kind}", self.session.user_id);
+        if enabled {
+            self.write(
+                reqwest::Method::POST,
+                &path,
+                &[(field, id.to_string())],
+                None,
+            )?;
+        } else {
+            self.write(reqwest::Method::DELETE, &format!("{path}/{id}"), &[], None)?;
+        }
+        Ok(())
+    }
+
+    pub fn create_playlist(&self, title: &str) -> Result<PlaylistInfo> {
+        let raw: RawPlaylist = self
+            .write(
+                reqwest::Method::POST,
+                &format!("users/{}/playlists", self.session.user_id),
+                &[("title", title.into()), ("description", String::new())],
+                None,
+            )?
+            .json()?;
+        Ok(PlaylistInfo {
+            id: raw.uuid,
+            title: raw.title,
+        })
+    }
+
+    pub fn playlist_snapshot(&self, id: &str) -> Result<(Vec<PlaylistEntry>, String)> {
+        let metadata = self.get(
+            &format!("playlists/{id}"),
+            &[("countryCode", &self.session.country_code)],
+        )?;
+        let etag = metadata
+            .headers()
+            .get(reqwest::header::ETAG)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("")
+            .to_owned();
+        let entries = self.all::<RawListItem>(&format!("playlists/{id}/items"), &[])?;
+        let mut tracks = Vec::new();
+        for (index, entry) in entries.into_iter().enumerate() {
+            if entry.item_type == "track" {
+                tracks.push(PlaylistEntry {
+                    index,
+                    track: serde_json::from_value::<RawTrack>(entry.item)?.into(),
+                });
+            }
+        }
+        Ok((tracks, etag))
+    }
+    pub fn add_to_playlist(&self, id: &str, tracks: &[TrackInfo]) -> Result<()> {
+        // Use bounded batches and a fresh version for each append. The end index
+        // includes videos so adding tracks never moves an existing video.
+        for (batch_number, batch) in tracks.chunks(100).enumerate() {
+            let result = (|| -> Result<()> {
+                let metadata = self.get(
+                    &format!("playlists/{id}"),
+                    &[("countryCode", &self.session.country_code)],
+                )?;
+                let etag = metadata
+                    .headers()
+                    .get(reqwest::header::ETAG)
+                    .and_then(|h| h.to_str().ok())
+                    .ok_or_else(|| anyhow!("Playlist version is missing"))?
+                    .to_owned();
+                let metadata: serde_json::Value = metadata.json()?;
+                let end = metadata
+                    .get("numberOfTracks")
+                    .and_then(|v| v.as_u64())
+                    .ok_or_else(|| anyhow!("Playlist size is missing"))?
+                    + metadata
+                        .get("numberOfVideos")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                let ids = batch
+                    .iter()
+                    .map(|t| t.id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                self.write(
+                    reqwest::Method::POST,
+                    &format!("playlists/{id}/items"),
+                    &[
+                        ("trackIds", ids),
+                        ("toIndex", end.to_string()),
+                        ("onArtifactNotFound", "FAIL".into()),
+                        ("onDupes", "SKIP".into()),
+                    ],
+                    Some(&etag),
+                )?;
+                Ok(())
+            })();
+            if let Err(error) = result {
+                anyhow::bail!(
+                    "Playlist append stopped after {} completed batches: {error}",
+                    batch_number
+                );
+            }
+        }
+        Ok(())
+    }
+    pub fn remove_playlist_item(&self, id: &str, index: usize, etag: &str) -> Result<()> {
+        if etag.is_empty() {
+            anyhow::bail!("Playlist version unavailable; editing disabled.");
+        }
+        self.write(
+            reqwest::Method::DELETE,
+            &format!("playlists/{id}/items/{index}"),
+            &[],
+            Some(etag),
+        )?;
+        Ok(())
+    }
+    pub fn move_playlist_item(&self, id: &str, from: usize, to: usize, etag: &str) -> Result<()> {
+        if etag.is_empty() {
+            anyhow::bail!("Playlist version unavailable; editing disabled.");
+        }
+        self.write(
+            reqwest::Method::POST,
+            &format!("playlists/{id}/items/{from}"),
+            &[("toIndex", to.to_string())],
+            Some(etag),
+        )?;
+        Ok(())
+    }
+    pub fn artist_albums(&self, id: u64, singles: bool) -> Result<Vec<AlbumInfo>> {
+        let params = if singles {
+            vec![("filter", "EPSANDSINGLES")]
+        } else {
+            Vec::new()
+        };
+        Ok(self
+            .all::<SearchAlbum>(&format!("artists/{id}/albums"), &params)?
+            .into_iter()
+            .map(Into::into)
+            .collect())
     }
 
     // ── Track ────────────────────────────────────────────────────────────────
@@ -243,16 +500,22 @@ impl TidalClient {
         }
 
         let info: PlaybackInfo = resp.json()?;
-        let decoded = base64::engine::general_purpose::STANDARD.decode(&info.manifest)
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&info.manifest)
             .map_err(|e| anyhow!("base64 decode: {}", e))?;
 
         if info.manifest_mime_type.contains("bts") {
             let bts: BtsManifest = serde_json::from_slice(&decoded)
                 .map_err(|e| anyhow!("BTS manifest parse: {}", e))?;
-            let url = bts.urls.into_iter().next()
+            let url = bts
+                .urls
+                .into_iter()
+                .next()
                 .ok_or_else(|| anyhow!("Empty URL list in manifest"))?;
             let encryption = if bts.encryption_type == "OLD_AES" {
-                let key_id = bts.key_id.ok_or_else(|| anyhow!("Missing keyId for encrypted track"))?;
+                let key_id = bts
+                    .key_id
+                    .ok_or_else(|| anyhow!("Missing keyId for encrypted track"))?;
                 Some(decrypt_security_token(&key_id)?)
             } else {
                 None
@@ -260,15 +523,22 @@ impl TidalClient {
             Ok(StreamInfo { url, encryption })
         } else if info.manifest_mime_type.contains("dash") {
             let xml = String::from_utf8_lossy(&decoded);
-            let url = xml.lines()
+            let url = xml
+                .lines()
                 .find(|l| l.contains("<BaseURL>"))
                 .and_then(|l| l.split("<BaseURL>").nth(1))
                 .and_then(|l| l.split("</BaseURL>").next())
                 .map(|s| s.trim().to_string())
                 .ok_or_else(|| anyhow!("Could not extract BaseURL from DASH manifest"))?;
-            Ok(StreamInfo { url, encryption: None })
+            Ok(StreamInfo {
+                url,
+                encryption: None,
+            })
         } else {
-            Err(anyhow!("Unknown manifest type: {}", info.manifest_mime_type))
+            Err(anyhow!(
+                "Unknown manifest type: {}",
+                info.manifest_mime_type
+            ))
         }
     }
 
@@ -285,31 +555,41 @@ impl TidalClient {
         }
 
         let limit_s = limit.to_string();
-        let resp = self.get("search", &[
-            ("query", query),
-            ("limit", &limit_s),
-            ("types", "TRACKS"),
-            ("countryCode", &self.session.country_code),
-        ])?;
+        let resp = self.get(
+            "search",
+            &[
+                ("query", query),
+                ("limit", &limit_s),
+                ("types", "TRACKS"),
+                ("countryCode", &self.session.country_code),
+            ],
+        )?;
         let data: SearchResp = resp.json()?;
-        Ok(data.tracks.map(|t| t.items.into_iter().map(Into::into).collect())
+        Ok(data
+            .tracks
+            .map(|t| t.items.into_iter().map(Into::into).collect())
             .unwrap_or_default())
     }
 
     pub fn search_albums(&self, query: &str, limit: u32) -> Result<Vec<AlbumInfo>> {
         let limit_s = limit.to_string();
-        let resp = self.get("search", &[
-            ("query", query),
-            ("limit", &limit_s),
-            ("types", "ALBUMS"),
-            ("countryCode", &self.session.country_code),
-        ])?;
+        let resp = self.get(
+            "search",
+            &[
+                ("query", query),
+                ("limit", &limit_s),
+                ("types", "ALBUMS"),
+                ("countryCode", &self.session.country_code),
+            ],
+        )?;
         let data: AlbumSearchResponse = resp.json()?;
-        Ok(data.albums.map(|a| a.items.into_iter().map(Into::into).collect())
+        Ok(data
+            .albums
+            .map(|a| a.items.into_iter().map(Into::into).collect())
             .unwrap_or_default())
     }
 
-    pub fn search_artists(&self, query: &str) -> Result<Vec<ArtistInfo>> {
+    pub fn search_artists(&self, query: &str, limit: u32) -> Result<Vec<ArtistInfo>> {
         #[derive(Deserialize)]
         struct SearchResp {
             artists: Option<SearchItems>,
@@ -319,16 +599,28 @@ impl TidalClient {
             items: Vec<RawArtist>,
         }
 
-        let resp = self.get("search", &[
-            ("query", query),
-            ("limit", "5"),
-            ("types", "ARTISTS"),
-            ("countryCode", &self.session.country_code),
-        ])?;
+        let limit_s = limit.to_string();
+        let resp = self.get(
+            "search",
+            &[
+                ("query", query),
+                ("limit", &limit_s),
+                ("types", "ARTISTS"),
+                ("countryCode", &self.session.country_code),
+            ],
+        )?;
         let data: SearchResp = resp.json()?;
-        Ok(data.artists.map(|a| a.items.into_iter()
-            .map(|r| ArtistInfo { id: r.id, name: r.name })
-            .collect())
+        Ok(data
+            .artists
+            .map(|a| {
+                a.items
+                    .into_iter()
+                    .map(|r| ArtistInfo {
+                        id: r.id,
+                        name: r.name,
+                    })
+                    .collect()
+            })
             .unwrap_or_default())
     }
 
@@ -340,7 +632,10 @@ impl TidalClient {
         let limit_s = limit.to_string();
         let resp = self.get(
             &format!("artists/{}/toptracks", artist_id),
-            &[("limit", &limit_s), ("countryCode", &self.session.country_code)],
+            &[
+                ("limit", &limit_s),
+                ("countryCode", &self.session.country_code),
+            ],
         )?;
         let data: Resp = resp.json()?;
         Ok(data.items.into_iter().map(Into::into).collect())
@@ -374,11 +669,14 @@ impl TidalClient {
             mix_type: String,
         }
 
-        let resp = self.get("pages/my_collection_my_mixes", &[
-            ("deviceType", "BROWSER"),
-            ("locale", "en_US"),
-            ("countryCode", &self.session.country_code),
-        ])?;
+        let resp = self.get(
+            "pages/my_collection_my_mixes",
+            &[
+                ("deviceType", "BROWSER"),
+                ("locale", "en_US"),
+                ("countryCode", &self.session.country_code),
+            ],
+        )?;
         let data: PageResp = resp.json()?;
 
         let mut mixes = Vec::new();
@@ -389,7 +687,10 @@ impl TidalClient {
                         if let Some(paged) = module.paged_list {
                             for m in paged.items {
                                 if !m.mix_type.contains("VIDEO") {
-                                    mixes.push(MixInfo { id: m.id, title: m.title });
+                                    mixes.push(MixInfo {
+                                        id: m.id,
+                                        title: m.title,
+                                    });
                                 }
                             }
                         }
@@ -401,79 +702,31 @@ impl TidalClient {
     }
 
     pub fn mix_tracks(&self, mix_id: &str) -> Result<Vec<TrackInfo>> {
-        #[derive(Deserialize)]
-        struct Resp {
-            items: Vec<MixItem>,
-        }
-        #[derive(Deserialize)]
-        struct MixItem {
-            #[serde(rename = "type")]
-            item_type: String,
-            item: Option<RawTrack>,
-        }
-
-        let resp = self.get(
-            &format!("mixes/{}/items", mix_id),
-            &[
-                ("limit", "50"),
-                ("deviceType", "BROWSER"),
-                ("countryCode", &self.session.country_code),
-            ],
-        )?;
-        let data: Resp = resp.json()?;
-        Ok(data.items.into_iter()
-            .filter(|i| i.item_type == "track")
-            .filter_map(|i| i.item.map(Into::into))
-            .collect())
+        self.list_tracks(
+            &format!("mixes/{mix_id}/items"),
+            &[("deviceType", "BROWSER")],
+        )
     }
-
-    // ── Playlists ────────────────────────────────────────────────────────────
 
     pub fn playlists(&self) -> Result<Vec<PlaylistInfo>> {
-        #[derive(Deserialize)]
-        struct Resp {
-            items: Vec<RawPlaylist>,
-        }
-        #[derive(Deserialize)]
-        struct RawPlaylist {
-            uuid: String,
-            title: String,
-        }
-
-        let resp = self.get(
-            &format!("users/{}/playlists", self.session.user_id),
-            &[("countryCode", &self.session.country_code), ("limit", "50")],
-        )?;
-        let data: Resp = resp.json()?;
-        Ok(data.items.into_iter()
-            .map(|p| PlaylistInfo { id: p.uuid, title: p.title })
+        Ok(self
+            .all::<RawPlaylist>(&format!("users/{}/playlists", self.session.user_id), &[])?
+            .into_iter()
+            .map(|p| PlaylistInfo {
+                id: p.uuid,
+                title: p.title,
+            })
             .collect())
     }
-
-    pub fn playlist_tracks(&self, playlist_id: &str) -> Result<Vec<TrackInfo>> {
-        #[derive(Deserialize)]
-        struct Resp {
-            items: Vec<PlaylistItem>,
-        }
-        #[derive(Deserialize)]
-        struct PlaylistItem {
-            #[serde(rename = "type")]
-            item_type: String,
-            item: Option<RawTrack>,
-        }
-
-        let resp = self.get(
-            &format!("playlists/{}/items", playlist_id),
-            &[
-                ("limit", "50"),
-                ("countryCode", &self.session.country_code),
-            ],
-        )?;
-        let data: Resp = resp.json()?;
-        Ok(data.items.into_iter()
+    fn list_tracks(&self, path: &str, params: &[(&str, &str)]) -> Result<Vec<TrackInfo>> {
+        self.all::<RawListItem>(path, params)?
+            .into_iter()
             .filter(|i| i.item_type == "track")
-            .filter_map(|i| i.item.map(Into::into))
-            .collect())
+            .map(|i| Ok(serde_json::from_value::<RawTrack>(i.item)?.into()))
+            .collect()
+    }
+    pub fn playlist_tracks(&self, playlist_id: &str) -> Result<Vec<TrackInfo>> {
+        self.list_tracks(&format!("playlists/{playlist_id}/items"), &[])
     }
 
     // ── Radio ────────────────────────────────────────────────────────────────
@@ -495,17 +748,11 @@ impl TidalClient {
     // ── Library (favorites) ────────────────────────────────────────────────
 
     pub fn album_tracks(&self, album_id: u64) -> Result<Vec<TrackInfo>> {
-        #[derive(Deserialize)]
-        struct Resp {
-            items: Vec<RawTrack>,
-        }
-
-        let resp = self.get(
-            &format!("albums/{}/tracks", album_id),
-            &[("countryCode", &self.session.country_code), ("limit", "100")],
-        )?;
-        let data: Resp = resp.json()?;
-        Ok(data.items.into_iter().map(Into::into).collect())
+        Ok(self
+            .all::<RawTrack>(&format!("albums/{album_id}/tracks"), &[])?
+            .into_iter()
+            .map(Into::into)
+            .collect())
     }
 
     // ── Library (page-level, for streaming) ────────────────────────────────
@@ -513,62 +760,112 @@ impl TidalClient {
     /// Fetch a single page of liked tracks. Returns (tracks, total_count).
     pub fn liked_tracks_page(&self, offset: u64, limit: u64) -> Result<(Vec<TrackInfo>, u64)> {
         #[derive(Deserialize)]
-        struct Resp { items: Vec<FavItem>, #[serde(rename = "totalNumberOfItems")] total: Option<u64> }
+        struct Resp {
+            items: Vec<FavItem>,
+            #[serde(rename = "totalNumberOfItems")]
+            total: Option<u64>,
+        }
         #[derive(Deserialize)]
-        struct FavItem { item: RawTrack }
+        struct FavItem {
+            item: RawTrack,
+        }
 
         let offset_s = offset.to_string();
         let limit_s = limit.to_string();
         let resp = self.get(
             &format!("users/{}/favorites/tracks", self.session.user_id),
-            &[("countryCode", &self.session.country_code), ("limit", &limit_s), ("offset", &offset_s)],
+            &[
+                ("countryCode", &self.session.country_code),
+                ("limit", &limit_s),
+                ("offset", &offset_s),
+            ],
         )?;
         let data: Resp = resp.json()?;
         let total = data.total.unwrap_or(0);
-        Ok((data.items.into_iter().map(|f| f.item.into()).collect(), total))
+        Ok((
+            data.items.into_iter().map(|f| f.item.into()).collect(),
+            total,
+        ))
     }
 
     /// Fetch a single page of favorite albums. Returns (albums, total_count).
     pub fn favorite_albums_page(&self, offset: u64, limit: u64) -> Result<(Vec<AlbumInfo>, u64)> {
         #[derive(Deserialize)]
-        struct Resp { items: Vec<FavItem>, #[serde(rename = "totalNumberOfItems")] total: Option<u64> }
+        struct Resp {
+            items: Vec<FavItem>,
+            #[serde(rename = "totalNumberOfItems")]
+            total: Option<u64>,
+        }
         #[derive(Deserialize)]
-        struct FavItem { item: RawFavAlbum }
+        struct FavItem {
+            item: RawFavAlbum,
+        }
         #[derive(Deserialize)]
-        struct RawFavAlbum { id: u64, title: String, artist: Option<RawArtist>, cover: Option<String> }
+        struct RawFavAlbum {
+            id: u64,
+            title: String,
+            artist: Option<RawArtist>,
+            cover: Option<String>,
+        }
 
         let offset_s = offset.to_string();
         let limit_s = limit.to_string();
         let resp = self.get(
             &format!("users/{}/favorites/albums", self.session.user_id),
-            &[("countryCode", &self.session.country_code), ("limit", &limit_s), ("offset", &offset_s)],
+            &[
+                ("countryCode", &self.session.country_code),
+                ("limit", &limit_s),
+                ("offset", &offset_s),
+            ],
         )?;
         let data: Resp = resp.json()?;
         let total = data.total.unwrap_or(0);
-        let albums = data.items.into_iter().map(|f| AlbumInfo {
-            id: f.item.id, title: f.item.title,
-            artist_name: f.item.artist.map(|a| a.name).unwrap_or_default(),
-            cover: f.item.cover,
-        }).collect();
+        let albums = data
+            .items
+            .into_iter()
+            .map(|f| AlbumInfo {
+                id: f.item.id,
+                title: f.item.title,
+                artist_name: f.item.artist.map(|a| a.name).unwrap_or_default(),
+                cover: f.item.cover,
+            })
+            .collect();
         Ok((albums, total))
     }
 
     /// Fetch a single page of favorite artists. Returns (artists, total_count).
     pub fn favorite_artists_page(&self, offset: u64, limit: u64) -> Result<(Vec<ArtistInfo>, u64)> {
         #[derive(Deserialize)]
-        struct Resp { items: Vec<FavItem>, #[serde(rename = "totalNumberOfItems")] total: Option<u64> }
+        struct Resp {
+            items: Vec<FavItem>,
+            #[serde(rename = "totalNumberOfItems")]
+            total: Option<u64>,
+        }
         #[derive(Deserialize)]
-        struct FavItem { item: RawArtist }
+        struct FavItem {
+            item: RawArtist,
+        }
 
         let offset_s = offset.to_string();
         let limit_s = limit.to_string();
         let resp = self.get(
             &format!("users/{}/favorites/artists", self.session.user_id),
-            &[("countryCode", &self.session.country_code), ("limit", &limit_s), ("offset", &offset_s)],
+            &[
+                ("countryCode", &self.session.country_code),
+                ("limit", &limit_s),
+                ("offset", &offset_s),
+            ],
         )?;
         let data: Resp = resp.json()?;
         let total = data.total.unwrap_or(0);
-        let artists = data.items.into_iter().map(|f| ArtistInfo { id: f.item.id, name: f.item.name }).collect();
+        let artists = data
+            .items
+            .into_iter()
+            .map(|f| ArtistInfo {
+                id: f.item.id,
+                name: f.item.name,
+            })
+            .collect();
         Ok((artists, total))
     }
 
@@ -576,7 +873,10 @@ impl TidalClient {
 
     pub fn fetch_cover(&self, cover_id: &str, size: u32) -> Result<Vec<u8>> {
         let path = cover_id.replace('-', "/");
-        let url = format!("https://resources.tidal.com/images/{}/{}x{}.jpg", path, size, size);
+        let url = format!(
+            "https://resources.tidal.com/images/{}/{}x{}.jpg",
+            path, size, size
+        );
         let bytes = self.client.get(&url).send()?.bytes()?;
         Ok(bytes.to_vec())
     }
@@ -588,19 +888,18 @@ impl TidalClient {
 // The same key is used by python-tidal and other open-source clients.
 // base64: UIlTTEMmmLfGowo/UC60x2H45W6MdGgTRfo/umg4754=
 const TIDAL_MASTER_KEY: &[u8] = &[
-    0x50, 0x89, 0x53, 0x4C, 0x43, 0x26, 0x98, 0xB7,
-    0xC6, 0xA3, 0x0A, 0x3F, 0x50, 0x2E, 0xB4, 0xC7,
-    0x61, 0xF8, 0xE5, 0x6E, 0x8C, 0x74, 0x68, 0x13,
-    0x45, 0xFA, 0x3F, 0xBA, 0x68, 0x38, 0xEF, 0x9E,
+    0x50, 0x89, 0x53, 0x4C, 0x43, 0x26, 0x98, 0xB7, 0xC6, 0xA3, 0x0A, 0x3F, 0x50, 0x2E, 0xB4, 0xC7,
+    0x61, 0xF8, 0xE5, 0x6E, 0x8C, 0x74, 0x68, 0x13, 0x45, 0xFA, 0x3F, 0xBA, 0x68, 0x38, 0xEF, 0x9E,
 ];
 
 /// Decrypt Tidal's `OLD_AES` security token to recover the per-track AES-128-CTR
 /// key (16 bytes) and nonce (8 bytes).
 fn decrypt_security_token(key_id: &str) -> Result<EncryptionInfo> {
-    use cbc::cipher::{BlockDecryptMut, KeyIvInit, block_padding::NoPadding};
+    use cbc::cipher::{block_padding::NoPadding, BlockDecryptMut, KeyIvInit};
     type Aes256CbcDec = cbc::Decryptor<aes::Aes256>;
 
-    let token = base64::engine::general_purpose::STANDARD.decode(key_id)
+    let token = base64::engine::general_purpose::STANDARD
+        .decode(key_id)
         .map_err(|e| anyhow!("keyId base64: {}", e))?;
     if token.len() < 32 {
         return Err(anyhow!("Security token too short ({} bytes)", token.len()));
@@ -610,7 +909,9 @@ fn decrypt_security_token(key_id: &str) -> Result<EncryptionInfo> {
     let mut buf = token[16..].to_vec();
     // Pad to AES block boundary (should already be aligned, but be safe)
     let rem = buf.len() % 16;
-    if rem != 0 { buf.extend(std::iter::repeat(0u8).take(16 - rem)); }
+    if rem != 0 {
+        buf.extend(std::iter::repeat(0u8).take(16 - rem));
+    }
 
     Aes256CbcDec::new_from_slices(TIDAL_MASTER_KEY, iv)
         .map_err(|_| anyhow!("Invalid master key/IV length"))?
@@ -630,12 +931,21 @@ mod tests {
 
     #[test]
     fn album_search_parses_metadata_and_artist_fallback() {
-        let response: AlbumSearchResponse = serde_json::from_str(r#"{"albums":{"items":[
+        let response: AlbumSearchResponse = serde_json::from_str(
+            r#"{"albums":{"items":[
             {"id":1,"title":"Discovery","artist":{"id":2,"name":"Daft Punk"},"cover":"abc"},
             {"id":3,"title":"Other","artists":[{"id":4,"name":"Guest"}]},
             {"id":5,"title":"Minimal"}
-        ]}}"#).unwrap();
-        let albums: Vec<AlbumInfo> = response.albums.unwrap().items.into_iter().map(Into::into).collect();
+        ]}}"#,
+        )
+        .unwrap();
+        let albums: Vec<AlbumInfo> = response
+            .albums
+            .unwrap()
+            .items
+            .into_iter()
+            .map(Into::into)
+            .collect();
         assert_eq!(albums[0].id, 1);
         assert_eq!(albums[0].title, "Discovery");
         assert_eq!(albums[0].artist_name, "Daft Punk");
@@ -646,19 +956,142 @@ mod tests {
         assert!(empty.albums.is_none());
     }
 
+    fn raw_track(id: u64) -> serde_json::Value {
+        serde_json::json!({"id":id,"title":format!("Track {id}"),"album":{"id":1,"title":"Album"}})
+    }
+    #[test]
+    fn albums_and_playlists_fetch_every_page_even_with_server_page_caps() {
+        use crate::test_support::{Reply, Server};
+        let server = Server::new(vec![
+            Reply::json(
+                serde_json::json!({"items":[raw_track(1),raw_track(2)],"totalNumberOfItems":3}),
+            ),
+            Reply::json(serde_json::json!({"items":[raw_track(3)],"totalNumberOfItems":3})),
+            Reply::json(
+                serde_json::json!({"items":[{"uuid":"a","title":"A"}],"totalNumberOfItems":2}),
+            ),
+            Reply::json(
+                serde_json::json!({"items":[{"uuid":"b","title":"B"}],"totalNumberOfItems":2}),
+            ),
+        ]);
+        let c = server.client();
+        let tracks = c.album_tracks(10).unwrap();
+        assert_eq!(
+            tracks.iter().map(|t| t.id).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(c.playlists().unwrap().len(), 2);
+        let requests = server.requests.lock().unwrap();
+        assert!(requests[1].contains("offset=2"));
+        assert!(requests[3].contains("offset=1"));
+        assert!(requests[0].contains("countryCode=GB"));
+    }
+    #[test]
+    fn playlist_snapshot_preserves_video_indices_and_protects_edits() {
+        use crate::test_support::{Reply, Server};
+        let server = Server::new(vec![
+            Reply {
+                status: 200,
+                headers: "ETag: \"v1\"\r\n".into(),
+                body: "{}".into(),
+            },
+            Reply::json(
+                serde_json::json!({"items":[{"type":"video","item":{"id":9}},{"type":"track","item":raw_track(1)}],"totalNumberOfItems":3}),
+            ),
+            Reply::json(
+                serde_json::json!({"items":[{"type":"track","item":raw_track(2)}],"totalNumberOfItems":3}),
+            ),
+            Reply {
+                status: 204,
+                headers: String::new(),
+                body: String::new(),
+            },
+            Reply {
+                status: 412,
+                headers: String::new(),
+                body: "changed".into(),
+            },
+        ]);
+        let c = server.client();
+        let (tracks, etag) = c.playlist_snapshot("uuid").unwrap();
+        assert_eq!(etag, "\"v1\"");
+        assert_eq!(
+            tracks.iter().map(|e| e.index).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        c.move_playlist_item("uuid", 1, 2, &etag).unwrap();
+        assert!(c
+            .remove_playlist_item("uuid", 1, &etag)
+            .unwrap_err()
+            .to_string()
+            .contains("changed elsewhere"));
+        let requests = server.requests.lock().unwrap();
+        assert!(requests[3].starts_with("POST /playlists/uuid/items/1?"));
+        assert!(requests[3].to_lowercase().contains("if-none-match: \"v1\""));
+        assert!(requests[3].contains("toIndex=2"));
+        assert!(requests[4].starts_with("DELETE /playlists/uuid/items/1?"));
+    }
+    #[test]
+    fn favorites_and_playlist_creation_use_real_form_requests() {
+        use crate::test_support::{Reply, Server};
+        let server = Server::new(vec![
+            Reply::json(serde_json::json!({})),
+            Reply::json(serde_json::json!({})),
+            Reply::json(serde_json::json!({"uuid":"new","title":"My music"})),
+        ]);
+        let c = server.client();
+        c.set_favorite("albums", 123, true).unwrap();
+        c.set_favorite("albums", 123, false).unwrap();
+        assert_eq!(c.create_playlist("My music").unwrap().id, "new");
+        let r = server.requests.lock().unwrap();
+        assert!(r[0].starts_with("POST /users/1/favorites/albums?"));
+        assert!(r[0].contains("albumIds=123"));
+        assert!(r[1].starts_with("DELETE /users/1/favorites/albums/123?"));
+        assert!(r[2].contains("title=My+music"));
+    }
+
+    #[test]
+    fn playlist_append_uses_version_and_places_tracks_after_videos() {
+        use crate::test_support::{Reply, Server};
+        let server = Server::new(vec![
+            Reply {
+                status: 200,
+                headers: "ETag: \"v1\"\r\n".into(),
+                body: serde_json::json!({"numberOfTracks":2,"numberOfVideos":1}).to_string(),
+            },
+            Reply::json(serde_json::json!({"addedItemIds":[10]})),
+        ]);
+        server
+            .client()
+            .add_to_playlist("uuid", &[crate::player::test_track(10)])
+            .unwrap();
+        let requests = server.requests.lock().unwrap();
+        assert!(requests[1].starts_with("POST /playlists/uuid/items?"));
+        assert!(requests[1].contains("trackIds=10"));
+        assert!(requests[1].contains("toIndex=3"));
+        assert!(requests[1].contains("onDupes=SKIP"));
+        assert!(requests[1]
+            .to_ascii_lowercase()
+            .contains("if-none-match: \"v1\""));
+    }
+
     fn parse(json: &str) -> TrackInfo {
         serde_json::from_str::<RawTrack>(json).unwrap().into()
     }
 
     #[test]
     fn artist_from_artist_field() {
-        let t = parse(r#"{"id":1,"title":"Song","artist":{"id":10,"name":"Main Artist"},"album":{"id":100,"title":"Album"}}"#);
+        let t = parse(
+            r#"{"id":1,"title":"Song","artist":{"id":10,"name":"Main Artist"},"album":{"id":100,"title":"Album"}}"#,
+        );
         assert_eq!(t.artist_name, "Main Artist");
     }
 
     #[test]
     fn artist_falls_back_to_artists_array() {
-        let t = parse(r#"{"id":1,"title":"Song","artists":[{"id":10,"name":"First"},{"id":11,"name":"Second"}],"album":{"id":100,"title":"Album"}}"#);
+        let t = parse(
+            r#"{"id":1,"title":"Song","artists":[{"id":10,"name":"First"},{"id":11,"name":"Second"}],"album":{"id":100,"title":"Album"}}"#,
+        );
         assert_eq!(t.artist_name, "First");
     }
 
@@ -670,7 +1103,9 @@ mod tests {
 
     #[test]
     fn year_parsed_from_release_date() {
-        let t = parse(r#"{"id":1,"title":"Song","album":{"id":100,"title":"Album","releaseDate":"2021-05-14"}}"#);
+        let t = parse(
+            r#"{"id":1,"title":"Song","album":{"id":100,"title":"Album","releaseDate":"2021-05-14"}}"#,
+        );
         assert_eq!(t.album_release_year, Some(2021));
     }
 
@@ -682,13 +1117,17 @@ mod tests {
 
     #[test]
     fn track_copyright_takes_precedence_over_album() {
-        let t = parse(r#"{"id":1,"title":"Song","copyright":"Track (c)","album":{"id":100,"title":"Album","copyright":"Album (c)"}}"#);
+        let t = parse(
+            r#"{"id":1,"title":"Song","copyright":"Track (c)","album":{"id":100,"title":"Album","copyright":"Album (c)"}}"#,
+        );
         assert_eq!(t.album_copyright, Some("Track (c)".to_string()));
     }
 
     #[test]
     fn falls_back_to_album_copyright() {
-        let t = parse(r#"{"id":1,"title":"Song","album":{"id":100,"title":"Album","copyright":"Album (c)"}}"#);
+        let t = parse(
+            r#"{"id":1,"title":"Song","album":{"id":100,"title":"Album","copyright":"Album (c)"}}"#,
+        );
         assert_eq!(t.album_copyright, Some("Album (c)".to_string()));
     }
 
@@ -705,13 +1144,17 @@ mod tests {
 
     #[test]
     fn album_artist_falls_back_to_primary_artist() {
-        let t = parse(r#"{"id":1,"title":"Song","artist":{"id":10,"name":"Solo"},"album":{"id":100,"title":"Album"}}"#);
+        let t = parse(
+            r#"{"id":1,"title":"Song","artist":{"id":10,"name":"Solo"},"album":{"id":100,"title":"Album"}}"#,
+        );
         assert_eq!(t.album_artist, "Solo");
     }
 
     #[test]
     fn all_artists_collected() {
-        let t = parse(r#"{"id":1,"title":"Song","artists":[{"id":1,"name":"A"},{"id":2,"name":"B"},{"id":3,"name":"C"}],"album":{"id":100,"title":"Album"}}"#);
+        let t = parse(
+            r#"{"id":1,"title":"Song","artists":[{"id":1,"name":"A"},{"id":2,"name":"B"},{"id":3,"name":"C"}],"album":{"id":100,"title":"Album"}}"#,
+        );
         assert_eq!(t.artists, vec!["A", "B", "C"]);
     }
 
@@ -720,35 +1163,64 @@ mod tests {
     #[test]
     #[ignore = "requires a real Tidal session on disk (~/.config/lumitide/session.json)"]
     fn e2e_stream_decrypt() {
-        use std::io::{Read, Write};
         use ctr::cipher::{KeyIvInit, StreamCipher};
+        use std::io::{Read, Write};
         type Aes128Ctr = ctr::Ctr64BE<aes::Aes128>;
 
         // ── Step 1: session ───────────────────────────────────────────────────
         let session = crate::auth::get_session().expect("load session");
-        println!("[1] Session loaded — user_id={} country={}", session.user_id, session.country_code);
-        println!("    token type={} expired={}", session.token_type, session.is_expired());
+        println!(
+            "[1] Session loaded — user_id={} country={}",
+            session.user_id, session.country_code
+        );
+        println!(
+            "    token type={} expired={}",
+            session.token_type,
+            session.is_expired()
+        );
 
         // ── Step 2: stream_url ────────────────────────────────────────────────
         let track_id = 86430568u64; // Netsky — Escape (known LOSSLESS track)
         let client = TidalClient::new(session.clone());
         let stream_info = client.stream_url(track_id).expect("stream_url failed");
         println!("[2] stream_url OK");
-        println!("    url prefix  : {}", &stream_info.url[..stream_info.url.len().min(80)]);
+        println!(
+            "    url prefix  : {}",
+            &stream_info.url[..stream_info.url.len().min(80)]
+        );
         println!("    encrypted   : {}", stream_info.encryption.is_some());
         if let Some(ref enc) = stream_info.encryption {
-            println!("    key  (hex)  : {}", enc.key.iter().map(|b| format!("{:02x}", b)).collect::<String>());
-            println!("    nonce(hex)  : {}", enc.nonce.iter().map(|b| format!("{:02x}", b)).collect::<String>());
+            println!(
+                "    key  (hex)  : {}",
+                enc.key
+                    .iter()
+                    .map(|b| format!("{:02x}", b))
+                    .collect::<String>()
+            );
+            println!(
+                "    nonce(hex)  : {}",
+                enc.nonce
+                    .iter()
+                    .map(|b| format!("{:02x}", b))
+                    .collect::<String>()
+            );
         }
 
         // ── Step 3: download first 256 KiB ────────────────────────────────────
         let http = reqwest::blocking::Client::builder()
             .user_agent(crate::auth::TIDAL_UA)
-            .build().unwrap();
-        let mut resp = http.get(&stream_info.url)
+            .build()
+            .unwrap();
+        let mut resp = http
+            .get(&stream_info.url)
             .header("Range", "bytes=0-262143")
-            .send().expect("HTTP GET failed");
-        println!("[3] HTTP {} content-length={:?}", resp.status(), resp.content_length());
+            .send()
+            .expect("HTTP GET failed");
+        println!(
+            "[3] HTTP {} content-length={:?}",
+            resp.status(),
+            resp.content_length()
+        );
         assert!(resp.status().is_success(), "CDN returned {}", resp.status());
 
         let mut raw = Vec::new();
@@ -772,11 +1244,14 @@ mod tests {
         println!("[5] Magic bytes : {:02x?}", &raw[..8.min(raw.len())]);
         println!("    Detected ext: {}", ext);
         let is_flac = raw.starts_with(b"fLaC");
-        let is_mp4  = raw.len() >= 8 && &raw[4..8] == b"ftyp";
+        let is_mp4 = raw.len() >= 8 && &raw[4..8] == b"ftyp";
         println!("    is_flac={} is_mp4={}", is_flac, is_mp4);
 
         // ── Step 6: write to temp file and symphonia-probe it ─────────────────
-        let tmp = tempfile::Builder::new().suffix(&format!(".{}", ext)).tempfile().unwrap();
+        let tmp = tempfile::Builder::new()
+            .suffix(&format!(".{}", ext))
+            .tempfile()
+            .unwrap();
         let tmp_path = tmp.path().to_path_buf();
         {
             let mut f = std::fs::File::create(&tmp_path).unwrap();
@@ -784,29 +1259,38 @@ mod tests {
         }
         println!("[6] Wrote {} bytes to {}", raw.len(), tmp_path.display());
 
-        use symphonia::core::io::MediaSourceStream;
         use symphonia::core::formats::FormatOptions;
+        use symphonia::core::io::MediaSourceStream;
         use symphonia::core::meta::MetadataOptions;
         use symphonia::core::probe::Hint;
         let file = std::fs::File::open(&tmp_path).unwrap();
         let mss = MediaSourceStream::new(Box::new(file), Default::default());
         let mut hint = Hint::new();
         hint.with_extension(ext);
-        match symphonia::default::get_probe().format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default()) {
+        match symphonia::default::get_probe().format(
+            &hint,
+            mss,
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        ) {
             Ok(probed) => {
                 let tracks = probed.format.tracks();
                 println!("[6] Symphonia probed OK — {} track(s)", tracks.len());
                 for t in tracks {
-                    println!("    codec={:?} sample_rate={:?} channels={:?}",
-                        t.codec_params.codec,
-                        t.codec_params.sample_rate,
-                        t.codec_params.channels);
+                    println!(
+                        "    codec={:?} sample_rate={:?} channels={:?}",
+                        t.codec_params.codec, t.codec_params.sample_rate, t.codec_params.channels
+                    );
                 }
             }
             Err(e) => println!("[6] Symphonia probe FAILED: {}", e),
         }
 
-        assert!(is_flac || is_mp4, "Unrecognised audio format — magic bytes: {:02x?}", &raw[..8.min(raw.len())]);
+        assert!(
+            is_flac || is_mp4,
+            "Unrecognised audio format — magic bytes: {:02x?}",
+            &raw[..8.min(raw.len())]
+        );
     }
 
     /// Probe multiple playback endpoint variants to find which works with the current token.
@@ -818,42 +1302,95 @@ mod tests {
         let track_id = 86430568u64;
         let http = reqwest::blocking::Client::builder()
             .user_agent(crate::auth::TIDAL_UA)
-            .build().unwrap();
+            .build()
+            .unwrap();
 
         // Variant A: desktop.tidal.com with x-tidal-token (current impl)
         {
-            let r = http.get(format!("https://desktop.tidal.com/v1/tracks/{}/playbackinfo", track_id))
+            let r = http
+                .get(format!(
+                    "https://desktop.tidal.com/v1/tracks/{}/playbackinfo",
+                    track_id
+                ))
                 .header("x-tidal-token", &session.access_token)
                 .header("x-tidal-streamingsessionid", crate::auth::new_uuid())
-                .query(&[("audioquality","LOSSLESS"),("playbackmode","STREAM"),("assetpresentation","FULL"),("countryCode",&session.country_code)])
-                .send().unwrap();
-            println!("A desktop x-tidal-token:  {} — {}", r.status(), r.text().unwrap_or_default().chars().take(300).collect::<String>());
+                .query(&[
+                    ("audioquality", "LOSSLESS"),
+                    ("playbackmode", "STREAM"),
+                    ("assetpresentation", "FULL"),
+                    ("countryCode", &session.country_code),
+                ])
+                .send()
+                .unwrap();
+            println!(
+                "A desktop x-tidal-token:  {} — {}",
+                r.status(),
+                r.text()
+                    .unwrap_or_default()
+                    .chars()
+                    .take(300)
+                    .collect::<String>()
+            );
         }
 
         // Variant B: desktop.tidal.com with x-tidal-token + Origin header
         {
-            let r = http.get(format!("https://desktop.tidal.com/v1/tracks/{}/playbackinfo", track_id))
+            let r = http
+                .get(format!(
+                    "https://desktop.tidal.com/v1/tracks/{}/playbackinfo",
+                    track_id
+                ))
                 .header("x-tidal-token", &session.access_token)
                 .header("x-tidal-streamingsessionid", crate::auth::new_uuid())
                 .header("Origin", "https://desktop.tidal.com")
                 .header("Referer", "https://desktop.tidal.com/")
-                .query(&[("audioquality","LOSSLESS"),("playbackmode","STREAM"),("assetpresentation","FULL"),("countryCode",&session.country_code)])
-                .send().unwrap();
-            println!("B desktop x-tidal-token + Origin:  {} — {}", r.status(), r.text().unwrap_or_default().chars().take(300).collect::<String>());
+                .query(&[
+                    ("audioquality", "LOSSLESS"),
+                    ("playbackmode", "STREAM"),
+                    ("assetpresentation", "FULL"),
+                    ("countryCode", &session.country_code),
+                ])
+                .send()
+                .unwrap();
+            println!(
+                "B desktop x-tidal-token + Origin:  {} — {}",
+                r.status(),
+                r.text()
+                    .unwrap_or_default()
+                    .chars()
+                    .take(300)
+                    .collect::<String>()
+            );
         }
 
         // Variant C: api.tidal.com postpaywall with Authorization: Bearer — decode manifest
         {
-            let r = http.get(format!("https://api.tidal.com/v1/tracks/{}/playbackinfopostpaywall", track_id))
+            let r = http
+                .get(format!(
+                    "https://api.tidal.com/v1/tracks/{}/playbackinfopostpaywall",
+                    track_id
+                ))
                 .header("Authorization", session.auth_header())
-                .query(&[("audioquality","LOSSLESS"),("playbackmode","STREAM"),("assetpresentation","FULL"),("prefetchlevel","NONE"),("countryCode",&session.country_code)])
-                .send().unwrap();
+                .query(&[
+                    ("audioquality", "LOSSLESS"),
+                    ("playbackmode", "STREAM"),
+                    ("assetpresentation", "FULL"),
+                    ("prefetchlevel", "NONE"),
+                    ("countryCode", &session.country_code),
+                ])
+                .send()
+                .unwrap();
             let body = r.text().unwrap_or_default();
-            println!("C status + raw: {}", &body.chars().take(200).collect::<String>());
+            println!(
+                "C status + raw: {}",
+                &body.chars().take(200).collect::<String>()
+            );
             // decode and print the full manifest
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
                 if let Some(m) = v["manifest"].as_str() {
-                    let decoded = base64::engine::general_purpose::STANDARD.decode(m).unwrap_or_default();
+                    let decoded = base64::engine::general_purpose::STANDARD
+                        .decode(m)
+                        .unwrap_or_default();
                     println!("C manifest decoded: {}", String::from_utf8_lossy(&decoded));
                 }
             }

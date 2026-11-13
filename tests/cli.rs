@@ -88,3 +88,25 @@ fn search_limit_must_be_in_range() {
         assert!(String::from_utf8_lossy(&out.stderr).contains("invalid value"));
     }
 }
+
+#[test]
+fn startup_album_command_has_no_selection_prompts() {
+    let out = lumitide()
+        .args(["play", "album", "--help"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("--id"));
+    assert!(text.contains("--artist"));
+    for args in [
+        vec!["play", "album"],
+        vec!["play", "album", "--id", "0"],
+        vec!["play", "album", "Name", "--id", "123"],
+        vec!["play", "album", "--artist", "Artist", "--id", "123"],
+    ] {
+        let out = lumitide().args(args).output().unwrap();
+        assert!(!out.status.success());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("error:"));
+    }
+}

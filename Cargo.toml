@@ -1,10 +1,10 @@
 [package]
 name = "lumitide"
-version = "1.4.2"
+version = "1.5.0"
 edition = "2021"
 description = "Console music player for Tidal"
 license = "MIT"
-repository = "https://github.com/BreakLime/lumitide"
+repository = "https://github.com/JCooper-Bit/lumitide"
 
 [[bin]]
 name = "lumitide"

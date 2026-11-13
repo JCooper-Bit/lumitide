@@ -12,6 +12,10 @@ fn config_path() -> PathBuf {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    #[serde(default)]
+    pub theme: crate::theme::Mode,
+    #[serde(default)]
+    pub theme_file: Option<String>,
     #[serde(default = "default_search_limit")]
     pub search_limit: u32,
     #[serde(default = "default_output_dir")]
@@ -32,23 +36,35 @@ pub struct Config {
     pub show_controls_hint: bool,
 }
 
-fn default_search_limit() -> u32 { 10 }
-fn default_output_dir() -> String { ".".to_string() }
-fn default_cover_size() -> u32 { 640 }
-fn default_volume() -> f32 { 0.5 }
-fn default_true() -> bool { true }
+fn default_search_limit() -> u32 {
+    10
+}
+fn default_output_dir() -> String {
+    ".".to_string()
+}
+fn default_cover_size() -> u32 {
+    640
+}
+fn default_volume() -> f32 {
+    0.5
+}
+fn default_true() -> bool {
+    true
+}
 
 impl Default for Config {
     fn default() -> Self {
         Self {
-            search_limit:       10,
-            output_dir:         ".".to_string(),
-            cover_size:         640,
-            volume:             0.5,
-            drop_detection:     true,
-            always_color:       true,
-            pywal:              false,
-            calm_mode:          false,
+            theme: crate::theme::Mode::Auto,
+            theme_file: None,
+            search_limit: 10,
+            output_dir: ".".to_string(),
+            cover_size: 640,
+            volume: 0.5,
+            drop_detection: true,
+            always_color: true,
+            pywal: false,
+            calm_mode: false,
             show_controls_hint: true,
         }
     }
@@ -83,7 +99,12 @@ fn expand_tilde(path: &str) -> String {
     }
     if let Some(rest) = path.strip_prefix("~/") {
         return dirs::home_dir()
-            .map(|h| rest.split('/').fold(h, |acc, part| acc.join(part)).to_string_lossy().into_owned())
+            .map(|h| {
+                rest.split('/')
+                    .fold(h, |acc, part| acc.join(part))
+                    .to_string_lossy()
+                    .into_owned()
+            })
             .unwrap_or_else(|| path.to_string());
     }
     path.to_string()
@@ -151,7 +172,11 @@ mod tests {
     #[test]
     fn expand_tilde_resolves_tilde_slash_path() {
         let home = dirs::home_dir().expect("home dir available");
-        let expected = home.join("Downloads").join("DJ").to_string_lossy().into_owned();
+        let expected = home
+            .join("Downloads")
+            .join("DJ")
+            .to_string_lossy()
+            .into_owned();
         assert_eq!(expand_tilde("~/Downloads/DJ"), expected);
     }
 
@@ -176,11 +201,26 @@ pub fn edit_interactive() -> Result<()> {
         let items = vec![
             format!("Download folder     {}", cfg.output_dir),
             format!("Search results      {}", cfg.search_limit),
-            format!("Drop detection      {}", if cfg.drop_detection { "on" } else { "off" }),
-            format!("Always color        {}", if cfg.always_color   { "on" } else { "off" }),
-            format!("Pywal colors        {}", if cfg.pywal          { "on" } else { "off" }),
-            format!("Calm mode           {}", if cfg.calm_mode      { "on" } else { "off" }),
-            format!("Controls hint       {}", if cfg.show_controls_hint { "on" } else { "off" }),
+            format!(
+                "Drop detection      {}",
+                if cfg.drop_detection { "on" } else { "off" }
+            ),
+            format!(
+                "Always color        {}",
+                if cfg.always_color { "on" } else { "off" }
+            ),
+            format!(
+                "Pywal colors        {}",
+                if cfg.pywal { "on" } else { "off" }
+            ),
+            format!(
+                "Calm mode           {}",
+                if cfg.calm_mode { "on" } else { "off" }
+            ),
+            format!(
+                "Controls hint       {}",
+                if cfg.show_controls_hint { "on" } else { "off" }
+            ),
             "Back".to_string(),
         ];
 
@@ -193,7 +233,9 @@ pub fn edit_interactive() -> Result<()> {
             .default(0)
             .report(false)
             .interact_opt()?
-        else { break };
+        else {
+            break;
+        };
 
         match choice {
             0 => {
@@ -231,11 +273,41 @@ pub fn edit_interactive() -> Result<()> {
                     save(&cfg)?;
                 }
             }
-            2 => { cfg.drop_detection     = Confirm::new().with_prompt("Drop detection").default(cfg.drop_detection).interact()?;     save(&cfg)?; }
-            3 => { cfg.always_color       = Confirm::new().with_prompt("Always color").default(cfg.always_color).interact()?;         save(&cfg)?; }
-            4 => { cfg.pywal              = Confirm::new().with_prompt("Pywal colors").default(cfg.pywal).interact()?;                save(&cfg)?; }
-            5 => { cfg.calm_mode          = Confirm::new().with_prompt("Calm mode").default(cfg.calm_mode).interact()?;               save(&cfg)?; }
-            6 => { cfg.show_controls_hint = Confirm::new().with_prompt("Controls hint").default(cfg.show_controls_hint).interact()?;  save(&cfg)?; }
+            2 => {
+                cfg.drop_detection = Confirm::new()
+                    .with_prompt("Drop detection")
+                    .default(cfg.drop_detection)
+                    .interact()?;
+                save(&cfg)?;
+            }
+            3 => {
+                cfg.always_color = Confirm::new()
+                    .with_prompt("Always color")
+                    .default(cfg.always_color)
+                    .interact()?;
+                save(&cfg)?;
+            }
+            4 => {
+                cfg.pywal = Confirm::new()
+                    .with_prompt("Pywal colors")
+                    .default(cfg.pywal)
+                    .interact()?;
+                save(&cfg)?;
+            }
+            5 => {
+                cfg.calm_mode = Confirm::new()
+                    .with_prompt("Calm mode")
+                    .default(cfg.calm_mode)
+                    .interact()?;
+                save(&cfg)?;
+            }
+            6 => {
+                cfg.show_controls_hint = Confirm::new()
+                    .with_prompt("Controls hint")
+                    .default(cfg.show_controls_hint)
+                    .interact()?;
+                save(&cfg)?;
+            }
             _ => break,
         }
     }
@@ -263,4 +335,18 @@ pub fn open_editor() -> Result<()> {
         std::process::Command::new(editor).arg(&path).spawn()?;
     }
     Ok(())
+}
+
+pub fn directory() -> std::path::PathBuf {
+    config_path().parent().unwrap().to_owned()
+}
+
+pub fn expand_theme_path(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix("~/") {
+        dirs::home_dir()
+            .map(|p| p.join(rest).to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.into())
+    } else {
+        path.into()
+    }
 }

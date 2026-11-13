@@ -1,5 +1,7 @@
 # Lumitide
 
+This fork of [BreakLime/lumitide](https://github.com/BreakLime/lumitide) adds a persistent, keyboard-driven browser and player. **Build this fork from source for the features below**; upstream installers and releases do not include them.
+
 A terminal music player for Tidal, written in Rust.
 
 > [!WARNING]
@@ -15,26 +17,22 @@ Stream audio from your Tidal account directly in the terminal, with album art, a
 
 ![Lumitide demo](assets/demo.gif)
 
-**Playback:** `→/n` next &nbsp;`←/p` prev &nbsp;`Space` pause &nbsp;`↑/+` vol up &nbsp;`↓/-` vol down &nbsp;`d` download &nbsp;`r` radio &nbsp;`?` controls &nbsp;`q/Esc` back
-
-**Lists:** `↑↓` / `jk` navigate &nbsp;`Enter` play &nbsp;`d` queue for download &nbsp;`Esc/q` back
+Press `?` for key bindings. Search with `/`, change search type with `Tab`, and press `Enter` to open or play. Music continues while browsing.
 
 ## Features
 
-- **Stream** audio from Tidal in real time — **lossless FLAC** on Windows, **MP4/AAC** (HIGH quality) on Linux/macOS
-- **Album cover art** rendered as Braille characters in the terminal
-- **Spectrum visualizer** with peak-hold bars and beat/drop detection
-- **Album-art color theming** — title, spectrum bars, and transition arrows all take their color from the current cover
-- **Pywal integration** — optionally sync the color scheme with your [Pywal](https://github.com/dylanaraps/pywal) wallpaper palette
-- **Library** — browse liked tracks, saved albums, and followed artists with fuzzy search; auto-advances through results with track counter and animated transitions
-- **Mix mode** — browse and play your curated Tidal mixes with animated track transitions
-- **Playlist mode** — browse and play your Tidal playlists
-- **Radio** — press `r` on any track to start a Tidal radio seeded from it
-- **Search** — find tracks, albums, or artists; browse album tracks, play results in sequence, or queue an album for download
-- **Local playback** — shuffle local FLAC, MP3, and M4A files with the same UI
-- **Download** — press `d` while a track is playing to save it to disk; or press `d` on any album, mix, playlist, or track in a list view to queue it for **background download** without interrupting playback or navigation
-- **Download queue** — a live `⬇ Artist - Title  N / M` indicator appears at the bottom-right of every screen while the queue is running; total grows as you queue more
-- **Media key support** — control playback via media keys; track metadata and album art shown in Windows taskbar/lock screen and macOS Control Center
+- Album, track, and artist search with in-screen query entry and filtering.
+- Background playback: search and browse without stopping the current track.
+- Playback queue: append tracks or entire collections, play next, jump to an item, remove, and reorder.
+- Seek ±10 seconds or ±1 minute. Shuffle, repeat-one, repeat-all, and stop at the end.
+- Like/unlike tracks, save/unsave albums, and follow/unfollow artists.
+- Create playlists; add tracks/albums, remove tracks, and reorder. Playlist version checks reject conflicting edits.
+- Artist pages with top tracks, albums, singles, and EPs.
+- Complete paginated albums, playlists, mixes, and library collections.
+- Queue, track position, shuffle, and repeat saved every five seconds and on exit. Restored sessions start paused; `Space` resumes.
+- Startup album command that opens the TUI and immediately plays the full album in order.
+- Automatic Noctalia/Pywal colour integration with live palette reload and terminal palette fallback.
+- Existing Tidal streaming, Braille cover art, spectrum/beat visuals, media keys, radio, local file playback, and background downloads.
 
 ## Requirements
 
@@ -101,7 +99,7 @@ mv lumitide-linux ~/.local/bin/lumitide
 Requires the [Rust toolchain](https://rustup.rs).
 
 ```sh
-git clone https://github.com/BreakLime/lumitide.git
+git clone https://github.com/JCooper-Bit/lumitide.git
 cd lumitide
 cargo build --release
 ./target/release/lumitide
@@ -138,65 +136,72 @@ refreshed automatically on subsequent runs.
 
 ## Usage
 
-Running `lumitide` with no arguments opens an interactive menu:
-
-```
-> Search
-  My mixes
-  My playlists
-  My library
-  Local files
-  Config
-  Quit
-```
-
-CLI usage is also fully supported:
+Running `lumitide` opens the TUI. Use `/` to search, `Tab` to cycle Tracks / Albums / Artists, and `Enter` to submit. `Esc` cancels text entry. Text entry is used only for queries, filters, playlist names, download paths, and optional seek timestamps.
 
 ```sh
-lumitide search "Netsky"               # search tracks by title
-lumitide search "Chase The Sun" -n 20  # increase result count
-lumitide search "Discovery" --album    # browse album results and their tracks
-lumitide search "Daft Punk" --artist   # select an artist and play top tracks
-lumitide mix                           # browse and play your Tidal mixes
-lumitide library                       # browse liked tracks, saved albums, followed artists
-lumitide local                         # shuffle local audio files
-lumitide config                        # open the config file in your editor
+lumitide search "Netsky"               # track results
+lumitide search "Discovery" --album    # album results
+lumitide search "Daft Punk" --artist   # artist pages
+lumitide mix                           # curated mixes
+lumitide playlist                      # playlists, including creation/editing
+lumitide library                       # liked tracks, albums, and artists
+lumitide local                         # existing local-file player
+lumitide config                        # edit the JSON configuration
 ```
 
-Choose **Tracks**, **Albums**, or **Artists** after entering a query in the interactive Search menu.
-Album results support typing to filter, `Enter` to browse tracks, and `d` to download the album.
-Track results support `Enter` to play from the selection, next/previous during playback, and `d` to download a track.
-`Esc` returns to the previous list. Use `-A` / `--album` or `-a` / `--artist` on the CLI (mutually exclusive); `-n` accepts 1–100 results.
-The interactive menu uses the configured `search_limit`.
+### Play an album on startup
 
-## Key Bindings
+```sh
+lumitide play album --id 30214
+lumitide play album "Discovery" --artist "Daft Punk"
+```
 
-### During playback
+Both commands **open the TUI and start playing**. They load every track, start at track one in album order, and stop at the end. They override a restored queue's shuffle/repeat settings. An ID is the most reliable way to identify a particular release; it is the number in a Tidal album URL. Title lookup requires exactly one matching title/artist and shows an error instead of asking you to pick a release.
 
-| Key | Action |
-|-----|--------|
-| `→` / `n` | Next track |
-| `←` / `p` | Previous track |
-| `Space` | Pause / resume |
-| `↑` / `+` | Volume up |
-| `↓` / `-` | Volume down |
-| `d` | Download current track to disk |
-| `r` | Start radio from current track |
-| `?` | Toggle controls overlay |
-| `q` / `Esc` | Go back |
+For a Hyprland startup file, launch a terminal to host the TUI. For example, with Kitty:
 
-### In list views (library, search, mixes, playlists)
+```ini
+exec-once = kitty --class lumitide -e lumitide play album --id 30214
+```
+
+Replace the example ID and terminal with your choices. Authenticate to Tidal once before using autostart. A valid saved session is reused automatically.
+
+## Key bindings
 
 | Key | Action |
-|-----|--------|
-| `↑` / `↓` or `k` / `j` | Navigate |
-| `Enter` | Play selected item |
-| `d` | Queue selected item for background download |
-| `Esc` / `q` | Go back |
+|---|---|
+| `↑↓` / `k j`, `Home`, `End` | Navigate lists |
+| `Enter` | Open collection/artist; play from selected track |
+| `/`, `Tab` | Enter search; switch track/album/artist search |
+| `F` | Filter the current list |
+| `Esc` / `q` | Back (playback continues); quit from home |
+| `Ctrl-q` / `Ctrl-c` | Quit from anywhere |
+| `b`, `l`, `t`, `m` | Home, library, playlists, mixes |
+| `N` | Now Playing, with cover art and spectrum |
+| `Space` | Pause/resume; resume a restored session |
+| `n` / `→`, `p` / `←` | Next / previous track |
+| `+` / `-` | Volume |
+| `[` / `]` | Seek backward / forward 10 seconds |
+| `{` / `}` | Seek backward / forward 60 seconds |
+| `g` | Jump to a timestamp (`mm:ss` or seconds) |
+| `s`, `R` | Toggle shuffle; cycle repeat off/all/one |
+| `Q` | Playback queue |
+| `a`, `P` | Append selection; insert selection to play next |
+| `Delete`, `J` / `K` | Remove / reorder in queue or playlist track list |
+| `f` | Toggle track like, saved album, or followed artist |
+| `w` | Choose a playlist to receive the selected track/collection |
+| `c` | Create a playlist from the playlist browser/picker |
+| `u` | Reload playlist/search; otherwise refresh favourite markers |
+| `d`, `r` | Download selection; open selected track's radio |
+| `?` | Show key bindings |
+
+Seeking waits for the current file to finish buffering. Queue changes are local; playlist and favourite changes are sent to Tidal. Tidal permissions and subscription availability still apply. Errors appear in the footer; failed changes are not shown as successful.
+
+Open Config from the home screen to change settings with `Enter`; booleans toggle immediately and theme modes cycle. Only folder paths need text entry. The standalone local-file player keeps its existing controls.
 
 ## Configuration
 
-Run `lumitide config` to open the config menu. Settings are stored at
+Run `lumitide config` to open the JSON file in your editor, or choose Config in the TUI. Settings are stored at
 `~/.config/lumitide/config.json`.
 
 | Field | Default | Description |
@@ -207,13 +212,30 @@ Run `lumitide config` to open the config menu. Settings are stored at
 | `search_limit` | `10` | Default number of search results |
 | `drop_detection` | `true` | Enable beat/drop detection and color cycling |
 | `always_color` | `true` | Always show album-art colors (not only during drops) |
+| `theme` | `"auto"` | `auto`, `noctalia`, `pywal`, `terminal`, or `album` |
+| `theme_file` | `null` | Optional generated colour JSON path, with `~/` support |
 | `pywal` | `false` | Use [Pywal](https://github.com/dylanaraps/pywal) palette instead of album-art colors (reads `~/.cache/wal/colors.json` on all platforms) |
 | `calm_mode` | `false` | Static spectrum shape, no drop/beat effects |
 | `show_controls_hint` | `true` | Show "Press ? for ctrl" hint in the corner |
 
+### Noctalia, Hyprland, and CachyOS colours
+
+Hyprland itself does not prescribe a colour scheme. Lumitide follows the files produced by the desktop's theming tools. The default `"theme": "auto"` checks:
+
+1. `theme_file`, if set.
+2. `$NOCTALIA_CONFIG_DIR/colors.json`, then `$XDG_CONFIG_HOME/noctalia/colors.json` (normally `~/.config/noctalia/colors.json`), then the Noctalia cache directory.
+3. Pywal's `colors.json` in the XDG cache or `~/.cache/wal/`.
+4. The terminal's current ANSI palette.
+
+Noctalia's `mPrimary`, `mSecondary`, `mTertiary`, `mSurface`, `mOnSurface`, and `mOnSurfaceVariant` colours are supported directly. Flat Material colour JSON and Matugen JSON exports are also accepted. Files are reloaded once per second; wallpaper/theme changes do not require restarting Lumitide. Malformed/missing files fall back safely.
+
+If your Noctalia version themes Kitty/Alacritty/Foot rather than exporting `colors.json`, choose `"theme": "terminal"` to inherit its terminal palette. For another generated JSON file, set `"theme_file": "~/path/to/colors.json"`. No desktop files are modified and no hooks need to be installed. The legacy `pywal: true` setting still explicitly selects Pywal; disable it to use Noctalia auto-detection.
+
+Album art retains its own colours with `"theme": "album"`; desktop palettes recolour the art and visualizer when available. Media keys and MPRIS metadata/progress remain available to Noctalia's media widget.
+
 ## Performance
 
-Lumitide is built for low resource usage. Typical figures on a modern machine:
+Lumitide is built for low resource usage. Upstream figures below are reference values for the original player; they have not been remeasured for this fork:
 
 | Metric | Idle | Playing |
 |--------|------|---------|
