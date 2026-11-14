@@ -23,11 +23,12 @@ Press `?` for key bindings. Search with `/`, change search type with `Tab`, and 
 
 - Album, track, and artist search with in-screen query entry and filtering.
 - Background playback: search and browse without stopping the current track.
-- Playback queue: append tracks or entire collections, play next, jump to an item, remove, and reorder.
+- Playback queue: added tracks and collections take priority over remaining album tracks, preserving the order you add them. Play next, jump to an item, remove, and reorder.
 - Seek ±10 seconds or ±1 minute. Shuffle, repeat-one, repeat-all, and stop at the end.
 - Like/unlike tracks, save/unsave albums, and follow/unfollow artists.
 - Create playlists; add tracks/albums, remove tracks, and reorder. Playlist version checks reject conflicting edits.
 - Artist pages with top tracks, albums, singles, and EPs.
+- Lyrics mode: timed lyrics follow playback, with plain lyrics as a fallback (provided by [LRCLIB](https://lrclib.net)).
 - Complete paginated albums, playlists, mixes, and library collections.
 - Queue, track position, shuffle, and repeat saved every five seconds and on exit. Restored sessions start paused; `Space` resumes.
 - Startup album command that opens the TUI and immediately plays the full album in order.
@@ -169,34 +170,39 @@ Replace the example ID and terminal with your choices. Authenticate to Tidal onc
 
 ## Key bindings
 
+All letter shortcuts work in either case. Typed queries, playlist names, and paths retain their original case.
+
 | Key | Action |
 |---|---|
 | `↑↓` / `k j`, `Home`, `End` | Navigate lists |
 | `Enter` | Open collection/artist; play from selected track |
 | `/`, `Tab` | Enter search; switch track/album/artist search |
-| `F` | Filter the current list |
-| `Esc` / `q` | Back (playback continues); quit from home |
+| `Ctrl-f` | Filter the current list |
+| `Esc` | Back (playback continues); quit from home |
 | `Ctrl-q` / `Ctrl-c` | Quit from anywhere |
 | `b`, `l`, `t`, `m` | Home, library, playlists, mixes |
-| `N` | Now Playing, with cover art and spectrum |
+| `v` | Now Playing, with cover art and spectrum |
 | `Space` | Pause/resume; resume a restored session |
 | `n` / `→`, `p` / `←` | Next / previous track |
 | `+` / `-` | Volume |
 | `[` / `]` | Seek backward / forward 10 seconds |
 | `{` / `}` | Seek backward / forward 60 seconds |
 | `g` | Jump to a timestamp (`mm:ss` or seconds) |
-| `s`, `R` | Toggle shuffle; cycle repeat off/all/one |
-| `Q` | Playback queue |
-| `a`, `P` | Append selection; insert selection to play next |
-| `Delete`, `J` / `K` | Remove / reorder in queue or playlist track list |
+| `s`, `r` | Toggle shuffle; cycle repeat off/all/one |
+| `q` | Playback queue |
+| `a`, `i` | Add selection before remaining album tracks; insert to play next |
+| `Delete`, `Ctrl-↓` / `Ctrl-↑` | Remove / reorder in queue or playlist track list |
 | `f` | Toggle track like, saved album, or followed artist |
 | `w` | Choose a playlist to receive the selected track/collection |
 | `c` | Create a playlist from the playlist browser/picker |
 | `u` | Reload playlist/search; otherwise refresh favourite markers |
-| `d`, `r` | Download selection; open selected track's radio |
+| `d`, `Ctrl-r` | Download selection; open selected track's radio |
+| `y` | Lyrics for the playing track |
 | `?` | Show key bindings |
 
 Seeking waits for the current file to finish buffering. Queue changes are local; playlist and favourite changes are sent to Tidal. Tidal permissions and subscription availability still apply. Errors appear in the footer; failed changes are not shown as successful.
+
+Lyrics mode opens with `y` / `Y` and follows the current track automatically. `j` / `k` (or arrows) scroll manually; `Tab` resumes following. Playback, pause, next/previous, and seek shortcuts continue to work. Plain lyrics scroll manually. `u` retries a failed lookup, and `Esc` returns to the previous view. Lyrics availability and timing depend on LRCLIB; instrumental, missing-lyrics, and connection-error states are shown in the view. No API key or additional sign-in is needed.
 
 Open Config from the home screen to change settings with `Enter`; booleans toggle immediately. Only folder paths need text entry. The standalone local-file player keeps its existing controls.
 

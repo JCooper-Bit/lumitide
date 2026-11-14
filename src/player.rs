@@ -39,6 +39,12 @@ pub struct Queue {
     history: Vec<usize>,
     #[serde(default)]
     remaining: Vec<usize>,
+    #[serde(default)]
+    manual: Vec<usize>,
+    #[serde(default)]
+    pending: Vec<usize>,
+    #[serde(default)]
+    source_current: Option<usize>,
 }
 impl Queue {
     pub fn replace(&mut self, tracks: Vec<TrackInfo>, start: usize) {
@@ -48,12 +54,25 @@ impl Queue {
         } else {
             Some(start.min(self.tracks.len() - 1))
         };
+        self.source_current = self.current;
         self.history.clear();
+        self.manual.clear();
+        self.pending.clear();
         self.reset_shuffle();
     }
+    fn is_manual(&self, index: usize) -> bool {
+        self.manual.contains(&index)
+    }
     fn reset_shuffle(&mut self) {
+        let only_manual = self.manual.len() == self.tracks.len();
         self.remaining = (0..self.tracks.len())
-            .filter(|i| Some(*i) != self.current)
+            .filter(|i| {
+                if only_manual {
+                    Some(*i) != self.current
+                } else {
+                    Some(*i) != self.source_current && !self.is_manual(*i)
+                }
+            })
             .collect();
         self.remaining.shuffle(&mut rand::thread_rng());
     }
@@ -61,106 +80,184 @@ impl Queue {
         self.shuffle = !self.shuffle;
         self.reset_shuffle();
     }
-    /// Manual next bypasses repeat-one. Natural completion honours it.
+    fn source_next(&self) -> Option<usize> {
+        if self.manual.len() == self.tracks.len()
+            && self.repeat == Repeat::All
+            && !self.tracks.is_empty()
+        {
+            return self.current.map(|i| (i + 1) % self.tracks.len());
+        }
+        let anchor = self
+            .current
+            .filter(|&i| !self.is_manual(i))
+            .or(self.source_current);
+        let begin = anchor.map_or(0, |i| i + 1);
+        (begin..self.tracks.len())
+            .find(|&i| !self.is_manual(i))
+            .or_else(|| {
+                if self.repeat == Repeat::All {
+                    (0..self.tracks.len()).find(|&i| !self.is_manual(i))
+                } else {
+                    None
+                }
+            })
+    }
+    fn take_next(&mut self) -> Option<usize> {
+        if !self.pending.is_empty() {
+            return Some(self.pending.remove(0));
+        }
+        if self.shuffle {
+            if self.remaining.is_empty() && self.repeat == Repeat::All {
+                self.reset_shuffle();
+            }
+            self.remaining.pop().or_else(|| {
+                (self.repeat == Repeat::All)
+                    .then_some(self.source_current)
+                    .flatten()
+            })
+        } else {
+            self.source_next()
+        }
+    }
+    /// Explicitly queued tracks are FIFO and take priority over the source collection.
     pub fn advance(&mut self, natural: bool) {
-        let Some(i) = self.current else {
+        let Some(current) = self.current else {
             return;
         };
         if natural && self.repeat == Repeat::One {
             return;
         }
-        let next = if self.shuffle {
-            if self.remaining.is_empty() && self.repeat == Repeat::All {
-                self.reset_shuffle();
-            }
-            self.remaining
-                .pop()
-                .or_else(|| (self.repeat == Repeat::All).then_some(i))
-        } else if i + 1 < self.tracks.len() {
-            Some(i + 1)
-        } else if self.repeat == Repeat::All {
-            Some(0)
-        } else {
-            None
-        };
-        self.history.push(i);
+        if !self.is_manual(current) {
+            self.source_current = Some(current);
+        }
+        let next = self.take_next();
+        self.history.push(current);
         self.current = next;
+        if let Some(next) = next {
+            if !self.is_manual(next) {
+                self.source_current = Some(next);
+            }
+        }
     }
     fn upcoming(&self) -> Option<&TrackInfo> {
         let current = self.current?;
         let next = if self.repeat == Repeat::One {
             Some(current)
+        } else if let Some(&next) = self.pending.first() {
+            Some(next)
         } else if self.shuffle {
             self.remaining.last().copied()
-        } else if current + 1 < self.tracks.len() {
-            Some(current + 1)
-        } else if self.repeat == Repeat::All {
-            Some(0)
         } else {
-            None
+            self.source_next()
         };
         next.and_then(|i| self.tracks.get(i))
     }
     pub fn previous(&mut self) {
-        if let Some(i) = self.history.pop() {
+        if let Some(previous) = self.history.pop() {
             if let Some(current) = self.current {
-                if self.shuffle {
+                if self.shuffle && !self.is_manual(current) {
                     self.remaining.push(current);
                 }
             }
-            self.remaining.retain(|&n| n != i);
-            self.current = Some(i);
-        } else if let Some(i) = self.current {
-            self.current = Some(i.saturating_sub(1));
+            self.remaining.retain(|&i| i != previous);
+            self.pending.retain(|&i| i != previous);
+            self.current = Some(previous);
+            self.source_current = if !self.is_manual(previous) {
+                Some(previous)
+            } else {
+                self.history
+                    .iter()
+                    .rev()
+                    .copied()
+                    .find(|&i| !self.is_manual(i))
+            };
+        } else if let Some(current) = self.current {
+            self.jump(current.saturating_sub(1));
+        }
+    }
+    fn jump(&mut self, index: usize) {
+        if index >= self.tracks.len() {
+            return;
+        }
+        self.current = Some(index);
+        self.pending.retain(|&i| i != index);
+        if !self.is_manual(index) {
+            self.source_current = Some(index);
+        }
+        self.history.clear();
+        self.reset_shuffle();
+    }
+    fn insert(&mut self, tracks: Vec<TrackInfo>, next: bool) {
+        if tracks.is_empty() {
+            return;
+        }
+        let after_current = self.current.map_or(self.tracks.len(), |i| i + 1);
+        let at = if next {
+            after_current
+        } else {
+            self.pending
+                .iter()
+                .max()
+                .map_or(after_current, |i| (i + 1).max(after_current))
+        };
+        let count = tracks.len();
+        self.tracks.splice(at..at, tracks);
+        let shift = |i: usize| if i >= at { i + count } else { i };
+        self.current = self.current.map(shift);
+        self.source_current = self.source_current.map(shift);
+        for list in [
+            &mut self.history,
+            &mut self.remaining,
+            &mut self.manual,
+            &mut self.pending,
+        ] {
+            for i in list {
+                *i = shift(*i);
+            }
+        }
+        self.manual.extend(at..at + count);
+        if next {
+            self.pending.splice(0..0, at..at + count);
+        } else {
+            self.pending.extend(at..at + count);
         }
     }
     pub fn insert_next(&mut self, tracks: Vec<TrackInfo>) {
-        let at = self.current.map_or(self.tracks.len(), |i| i + 1);
-        let count = tracks.len();
-        self.tracks.splice(at..at, tracks);
-        for i in &mut self.history {
-            if *i >= at {
-                *i += count;
-            }
-        }
-        for i in &mut self.remaining {
-            if *i >= at {
-                *i += count;
-            }
-        }
-        // The next inserted item must actually play next, including in shuffle mode.
-        self.remaining.extend((at..at + count).rev());
+        self.insert(tracks, true);
     }
     pub fn append(&mut self, tracks: Vec<TrackInfo>) {
-        let start = self.tracks.len();
-        self.tracks.extend(tracks);
-        let mut new: Vec<_> = (start..self.tracks.len()).collect();
-        new.shuffle(&mut rand::thread_rng());
-        self.remaining.splice(0..0, new);
+        self.insert(tracks, false);
     }
     pub fn remove(&mut self, at: usize) -> bool {
         if at >= self.tracks.len() {
             return false;
         }
-        self.tracks.remove(at);
         let changed = self.current == Some(at);
-        self.current = self.current.and_then(|i| {
-            if i == at {
-                (at < self.tracks.len()).then_some(at)
-            } else {
-                Some(if i > at { i - 1 } else { i })
-            }
-        });
-        self.history.retain(|&i| i != at);
-        for i in &mut self.history {
-            if *i > at {
-                *i -= 1;
+        let removed_anchor = self.source_current == Some(at);
+        self.tracks.remove(at);
+        let remap = |i: usize| if i > at { i - 1 } else { i };
+        self.current = self.current.filter(|&i| i != at).map(remap);
+        self.source_current = self.source_current.filter(|&i| i != at).map(remap);
+        for list in [
+            &mut self.history,
+            &mut self.remaining,
+            &mut self.manual,
+            &mut self.pending,
+        ] {
+            list.retain(|&i| i != at);
+            for i in list {
+                *i = remap(*i);
             }
         }
-        self.remaining.retain(|&i| i != at);
-        for i in &mut self.remaining {
-            if *i > at {
-                *i -= 1;
+        if removed_anchor {
+            self.source_current = (0..at).rev().find(|&i| !self.is_manual(i));
+        }
+        if changed {
+            self.current = self.take_next();
+            if let Some(current) = self.current {
+                if !self.is_manual(current) {
+                    self.source_current = Some(current);
+                }
             }
         }
         self.remaining.retain(|&i| Some(i) != self.current);
@@ -181,12 +278,18 @@ impl Queue {
             }
         };
         self.current = self.current.map(remap);
-        for i in &mut self.history {
-            *i = remap(*i);
+        self.source_current = self.source_current.map(remap);
+        for list in [
+            &mut self.history,
+            &mut self.remaining,
+            &mut self.manual,
+            &mut self.pending,
+        ] {
+            for i in list {
+                *i = remap(*i);
+            }
         }
-        for i in &mut self.remaining {
-            *i = remap(*i);
-        }
+        self.pending.sort_unstable();
     }
 }
 
@@ -303,6 +406,21 @@ impl Player {
             .queue
             .remaining
             .retain(|&i| i < saved.queue.tracks.len());
+        saved.queue.manual.retain(|&i| i < saved.queue.tracks.len());
+        saved
+            .queue
+            .pending
+            .retain(|&i| i < saved.queue.tracks.len());
+        if saved
+            .queue
+            .source_current
+            .is_none_or(|i| i >= saved.queue.tracks.len())
+        {
+            saved.queue.source_current = saved
+                .queue
+                .current
+                .filter(|&i| !saved.queue.manual.contains(&i));
+        }
         let volume = Arc::new(Mutex::new(crate::config::load().volume));
         // Restored queues start paused, so opening the app never unexpectedly makes sound.
         let state = Arc::new(Mutex::new(State {
@@ -543,9 +661,7 @@ impl Player {
     pub fn select(&self, at: usize) {
         self.change(|s| {
             if at < s.saved.queue.tracks.len() {
-                s.saved.queue.current = Some(at);
-                s.saved.queue.history.clear();
-                s.saved.queue.reset_shuffle();
+                s.saved.queue.jump(at);
                 s.saved.position_ms = 0;
                 s.active = true;
                 s.paused = false;
@@ -572,9 +688,8 @@ impl Player {
         let mut s = self.state.lock().unwrap();
         if !s.active {
             if s.saved.queue.current.is_none() && !s.saved.queue.tracks.is_empty() {
-                s.saved.queue.current = Some(0);
-                s.saved.queue.history.clear();
-                s.saved.queue.reset_shuffle();
+                let first = s.saved.queue.pending.first().copied().unwrap_or(0);
+                s.saved.queue.jump(first);
             }
             if s.saved.queue.current.is_some() {
                 s.active = true;
@@ -857,6 +972,93 @@ mod tests {
                 assert_eq!(predicted, actual.current.map(|i| actual.tracks[i].id));
             }
         }
+    }
+    #[test]
+    fn queued_tracks_are_fifo_then_album_resumes_even_after_restart() {
+        let mut q = Queue::default();
+        q.replace(vec![test_track(1), test_track(2), test_track(3)], 0);
+        q.append(vec![test_track(10)]);
+        q.append(vec![test_track(11), test_track(12)]);
+        q.insert_next(vec![test_track(9)]);
+        assert_eq!(
+            q.tracks.iter().map(|t| t.id).collect::<Vec<_>>(),
+            vec![1, 9, 10, 11, 12, 2, 3]
+        );
+        let mut played = vec![];
+        while let Some(i) = q.current {
+            played.push(q.tracks[i].id);
+            let expected = q.upcoming().map(|t| t.id);
+            q.advance(true);
+            assert_eq!(expected, q.current.map(|i| q.tracks[i].id));
+            q = serde_json::from_slice(&serde_json::to_vec(&q).unwrap()).unwrap();
+        }
+        assert_eq!(played, vec![1, 9, 10, 11, 12, 2, 3]);
+    }
+    #[test]
+    fn explicit_queue_has_priority_with_shuffle_and_survives_edits() {
+        let mut q = Queue::default();
+        q.replace(tracks(4), 0);
+        q.toggle_shuffle();
+        q.append(vec![test_track(10)]);
+        q.append(vec![test_track(11)]);
+        q.move_item(1, 2);
+        q.advance(true);
+        assert_eq!(q.tracks[q.current.unwrap()].id, 11);
+        q.append(vec![test_track(12)]);
+        q.advance(true);
+        assert_eq!(q.tracks[q.current.unwrap()].id, 10);
+        q.advance(true);
+        assert_eq!(q.tracks[q.current.unwrap()].id, 12);
+        let mut source = vec![];
+        while q.current.is_some() {
+            q.advance(true);
+            if let Some(i) = q.current {
+                source.push(q.tracks[i].id);
+            }
+        }
+        source.sort_unstable();
+        assert_eq!(source, vec![1, 2, 3]);
+        q.shuffle = false;
+        q.replace(tracks(3), 0);
+        q.append(vec![test_track(10), test_track(11)]);
+        assert!(!q.remove(1));
+        q.advance(true);
+        assert_eq!(q.tracks[q.current.unwrap()].id, 11);
+        q.advance(true);
+        assert_eq!(q.tracks[q.current.unwrap()].id, 1);
+    }
+    #[test]
+    fn queue_added_after_album_ends_starts_before_restarting_album() {
+        let player = Player::for_test();
+        player.play_album(vec![test_track(1), test_track(2)]);
+        player.next();
+        player.next();
+        assert!(player.snapshot().queue.current.is_none());
+        player.enqueue(vec![test_track(9)], false);
+        player.toggle_pause();
+        let state = player.snapshot();
+        assert_eq!(state.queue.tracks[state.queue.current.unwrap()].id, 9);
+    }
+    #[test]
+    fn adding_during_queued_playback_preserves_order_and_duplicate_tracks() {
+        let mut q = Queue::default();
+        q.replace(vec![test_track(1), test_track(2)], 0);
+        q.append(vec![test_track(2)]);
+        q.advance(true);
+        q.append(vec![test_track(9)]);
+        q.advance(true);
+        assert_eq!(q.tracks[q.current.unwrap()].id, 9);
+        q.advance(true);
+        assert_eq!(q.tracks[q.current.unwrap()].id, 2);
+        q.advance(true);
+        assert!(q.current.is_none());
+        q = Queue::default();
+        q.append(vec![test_track(8), test_track(9)]);
+        q.jump(0);
+        q.repeat = Repeat::All;
+        q.advance(true);
+        q.advance(true);
+        assert_eq!(q.tracks[q.current.unwrap()].id, 8);
     }
     #[test]
     fn edits_preserve_current_track_and_insert_next() {

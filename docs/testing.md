@@ -24,3 +24,5 @@ ffmpeg -f lavfi -i anullsrc=r=44100:cl=stereo -t 12 -c:a flac -map_metadata -1 s
 Live Tidal account tests remain opt-in. Mock requests verify paths, bodies, pagination, mixed video/track indices, and conditional edit headers; they cannot verify account permissions, current service availability, or individual album availability.
 
 Preloading tests use local HTTP fixtures to check that the next track downloads before the current track ends, playback reuses that download, failed preloads can retry, and queue changes predict the correct successor.
+
+Queue tests cover explicit tracks taking priority over album playback, FIFO ordering, play-next, shuffle, edits, duplicate tracks, and restart state. Lyrics tests use local LRCLIB response fixtures to verify timed lyrics, offsets, plain/instrumental/missing results, version matching, scrolling, and case-insensitive hotkeys while preserving typed text.

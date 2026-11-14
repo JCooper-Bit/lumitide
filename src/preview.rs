@@ -897,7 +897,7 @@ fn play(
         if terminal.is_some() && event::poll(Duration::from_millis(90))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
-                    match key.code {
+                    match crate::keys::command(key).code {
                         KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => {
                             stop_all.store(true, Ordering::Relaxed);
                             break "quit".to_string();

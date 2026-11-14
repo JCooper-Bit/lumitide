@@ -14,7 +14,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Gauge, List, ListItem, Paragraph},
     Frame, Terminal,
 };
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
@@ -117,6 +117,7 @@ enum PageKind {
     Search,
     Queue,
     Playing,
+    Lyrics,
     Settings,
     Playlist {
         id: String,
@@ -175,10 +176,21 @@ enum JobResult {
     Favorite(String, u64, bool),
     Toast(String),
     Collection(Vec<TrackInfo>, char),
+    QueuedSelection(u64, char, std::result::Result<Vec<TrackInfo>, String>),
+    Lyrics(
+        u64,
+        std::result::Result<Option<crate::lyrics::Lyrics>, String>,
+    ),
 }
 struct Completion {
     navigation: Option<u64>,
     result: Result<JobResult>,
+}
+#[derive(Clone)]
+enum LyricsState {
+    Loading,
+    Ready(Option<crate::lyrics::Lyrics>),
+    Failed(String),
 }
 struct App {
     client: TidalClient,
@@ -203,6 +215,12 @@ struct App {
     last_config: Instant,
     redraw: bool,
     show_hints: bool,
+    lyrics: HashMap<u64, LyricsState>,
+    lyrics_track: Option<u64>,
+    lyrics_follow: bool,
+    queue_request: u64,
+    queue_apply: u64,
+    queue_results: BTreeMap<u64, (char, std::result::Result<Vec<TrackInfo>, String>)>,
 }
 fn home() -> Page {
     let mut p = Page::new(
@@ -303,6 +321,36 @@ fn all_favorites(c: &TidalClient) -> Result<HashSet<(String, u64)>> {
     Ok(out)
 }
 
+fn wrap_lyric(text: &str, width: usize) -> Vec<String> {
+    let width = width.saturating_sub(1).max(1);
+    let mut rows = vec![];
+    let mut line = String::new();
+    let mut used = 0;
+    for word in text.split_whitespace() {
+        let length = ratatui::text::Line::from(word).width();
+        if !line.is_empty() && used + 1 + length > width {
+            rows.push(std::mem::take(&mut line));
+            used = 0;
+        }
+        if !line.is_empty() {
+            line.push(' ');
+            used += 1;
+        }
+        for ch in word.chars() {
+            let size = ratatui::text::Line::from(ch.to_string()).width();
+            if used + size > width && !line.is_empty() {
+                rows.push(std::mem::take(&mut line));
+                used = 0;
+            }
+            line.push(ch);
+            used += size;
+        }
+    }
+    if !line.is_empty() || rows.is_empty() {
+        rows.push(line);
+    }
+    rows
+}
 fn parse_timestamp(text: &str) -> Result<u64> {
     let parts = text.trim().split(':').collect::<Vec<_>>();
     let seconds = match parts.as_slice() {
@@ -317,6 +365,15 @@ fn parse_timestamp(text: &str) -> Result<u64> {
     }
     .and_then(|s| s.checked_mul(1000));
     seconds.ok_or_else(|| anyhow::anyhow!("Use seconds or mm:ss, for example 90 or 1:30."))
+}
+fn selection_tracks(c: &TidalClient, row: Row) -> Result<Vec<TrackInfo>> {
+    match row {
+        Row::Track(t) => Ok(vec![t]),
+        Row::Album(a) => c.album_tracks(a.id),
+        Row::Playlist(p) => c.playlist_tracks(&p.id),
+        Row::Mix(m) => c.mix_tracks(&m.id),
+        _ => bail!("Select a track, album, mix, or playlist."),
+    }
 }
 fn playing_page() -> Page {
     let mut p = Page::new("Now playing", vec![]);
@@ -387,6 +444,12 @@ pub fn run(client: TidalClient, start: Start) -> Result<()> {
         last_config: Instant::now(),
         redraw: false,
         show_hints: true,
+        lyrics: HashMap::new(),
+        lyrics_track: None,
+        lyrics_follow: true,
+        queue_request: 0,
+        queue_apply: 0,
+        queue_results: BTreeMap::new(),
     };
     app.spawn(None, |c| Ok(JobResult::Favorites(all_favorites(&c)?)));
     match start {
@@ -664,7 +727,7 @@ impl App {
                     self.player.play(tracks, self.page.cursor);
                     self.navigate(playing_page());
                 }
-                self.toast("Playing — N now playing · Space pause · Q queue");
+                self.toast("Playing — v now playing · Space pause · q queue");
             }
             Row::Album(a) => self.load(a.title.clone(), move |c| {
                 Ok(JobResult::Page(Page::new(
@@ -704,7 +767,7 @@ impl App {
         }
     }
     fn selected_row(&self) -> Option<Row> {
-        if matches!(self.page.kind, PageKind::Playing) {
+        if matches!(self.page.kind, PageKind::Playing | PageKind::Lyrics) {
             let s = self.player.snapshot();
             s.queue
                 .current
@@ -716,15 +779,57 @@ impl App {
     }
     fn collection(&self, row: Row, action: char) {
         self.spawn(None, move |c| {
-            let tracks = match row {
-                Row::Track(t) => vec![t],
-                Row::Album(a) => c.album_tracks(a.id)?,
-                Row::Playlist(p) => c.playlist_tracks(&p.id)?,
-                Row::Mix(m) => c.mix_tracks(&m.id)?,
-                _ => bail!("Select a track, album, mix, or playlist."),
-            };
+            let tracks = selection_tracks(&c, row)?;
             Ok(JobResult::Collection(tracks, action))
         });
+    }
+    fn enqueue_selection(&mut self, row: Row, action: char) {
+        let order = self.queue_request;
+        self.queue_request += 1;
+        if let Row::Track(track) = row {
+            self.apply_queued_selection(order, action, Ok(vec![track]));
+        } else {
+            let mut session = self.client.session.clone();
+            let tx = self.tx.clone();
+            std::thread::spawn(move || {
+                let result = (|| {
+                    session = crate::auth::refreshed_session(&session)?;
+                    selection_tracks(&TidalClient::new(session), row)
+                })()
+                .map_err(|e: anyhow::Error| e.to_string());
+                let _ = tx.send(Completion {
+                    navigation: None,
+                    result: Ok(JobResult::QueuedSelection(order, action, result)),
+                });
+            });
+            self.toast("Loading selection…");
+        }
+    }
+    fn apply_queued_selection(
+        &mut self,
+        order: u64,
+        action: char,
+        result: std::result::Result<Vec<TrackInfo>, String>,
+    ) {
+        self.queue_results.insert(order, (action, result));
+        while let Some((action, result)) = self.queue_results.remove(&self.queue_apply) {
+            self.queue_apply += 1;
+            match result {
+                Ok(tracks) => {
+                    let count = tracks.len();
+                    self.player.enqueue(tracks, action == 'i');
+                    self.toast(format!(
+                        "Added {count} tracks {}",
+                        if action == 'i' {
+                            "to play next"
+                        } else {
+                            "before remaining album tracks"
+                        }
+                    ));
+                }
+                Err(error) => self.toast(error),
+            }
+        }
     }
     fn favorite(&mut self) {
         let Some((kind, id)) = self.selected_row().and_then(|r| r.favorite()) else {
@@ -777,9 +882,77 @@ impl App {
             Ok(JobResult::Page(p))
         });
     }
+    fn request_lyrics(&mut self, track: TrackInfo, reload: bool) {
+        let id = track.id;
+        self.lyrics_track = Some(id);
+        self.page.title = format!("Lyrics — {} — {}", track.title, track.artist_name);
+        if matches!(self.lyrics.get(&id), Some(LyricsState::Loading))
+            || (!reload && self.lyrics.contains_key(&id))
+        {
+            return;
+        }
+        if self.lyrics.len() >= 32 {
+            self.lyrics.clear();
+        }
+        self.lyrics.insert(id, LyricsState::Loading);
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let result = crate::lyrics::fetch(&track).map_err(|e| e.to_string());
+            let _ = tx.send(Completion {
+                navigation: None,
+                result: Ok(JobResult::Lyrics(id, result)),
+            });
+        });
+    }
+    fn show_lyrics(&mut self) {
+        let s = self.player.snapshot();
+        if let Some(track) = s.queue.current.and_then(|i| s.queue.tracks.get(i)).cloned() {
+            let mut page = Page::new("Lyrics", vec![]);
+            page.kind = PageKind::Lyrics;
+            self.navigate(page);
+            self.lyrics_follow = true;
+            self.request_lyrics(track, false);
+        } else {
+            self.toast("Start a track to view lyrics.");
+        }
+    }
+    fn lyrics_count(&self) -> usize {
+        self.lyrics_track
+            .and_then(|id| self.lyrics.get(&id))
+            .and_then(|state| {
+                if let LyricsState::Ready(Some(lyrics)) = state {
+                    Some(lyrics.lines().len())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0)
+    }
+    fn open_radio(&mut self) {
+        if let Some(Row::Track(t)) = self.selected_row() {
+            self.load("Track radio", move |c| {
+                Ok(JobResult::Page(Page::new(
+                    "Track radio",
+                    c.track_radio(t.id)?.into_iter().map(Row::Track).collect(),
+                )))
+            });
+        }
+    }
+    fn reorder_selected(&mut self, delta: isize) {
+        if matches!(self.page.kind, PageKind::Queue) {
+            if let Some((i, _)) = self.page.selected() {
+                let to = i.saturating_add_signed(delta);
+                self.player.reorder(i, to);
+                self.page.cursor = to.min(self.page.rows.len().saturating_sub(1));
+            }
+        } else if !self.loading {
+            self.edit_playlist(Some(delta));
+        }
+    }
     fn key(&mut self, key: KeyEvent) -> Result<bool> {
+        let command = crate::keys::command(key);
         if key.modifiers.contains(KeyModifiers::CONTROL)
-            && matches!(key.code, KeyCode::Char('q') | KeyCode::Char('c'))
+            && matches!(command.code, KeyCode::Char('q') | KeyCode::Char('c'))
         {
             return Ok(true);
         }
@@ -859,15 +1032,58 @@ impl App {
             }
             return Ok(false);
         }
+        let key = command;
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char('f') => {
+                    self.input = Some(Input::Filter(self.page.filter.clone()));
+                    return Ok(false);
+                }
+                KeyCode::Char('r') => {
+                    self.open_radio();
+                    return Ok(false);
+                }
+                KeyCode::Up => {
+                    self.reorder_selected(-1);
+                    return Ok(false);
+                }
+                KeyCode::Down => {
+                    self.reorder_selected(1);
+                    return Ok(false);
+                }
+                _ => {}
+            }
+        }
+        if matches!(self.page.kind, PageKind::Lyrics) {
+            let max = self.lyrics_count().saturating_sub(1);
+            let scroll = match key.code {
+                KeyCode::Up | KeyCode::Char('k') => Some(self.page.cursor.saturating_sub(1)),
+                KeyCode::Down | KeyCode::Char('j') => Some((self.page.cursor + 1).min(max)),
+                KeyCode::PageUp => Some(self.page.cursor.saturating_sub(10)),
+                KeyCode::PageDown => Some((self.page.cursor + 10).min(max)),
+                KeyCode::Home => Some(0),
+                KeyCode::End => Some(max),
+                KeyCode::Tab => {
+                    self.lyrics_follow = true;
+                    return Ok(false);
+                }
+                _ => None,
+            };
+            if let Some(cursor) = scroll {
+                self.lyrics_follow = false;
+                self.page.cursor = cursor;
+                return Ok(false);
+            }
+        }
         match key.code {
+            KeyCode::Char('y') => self.show_lyrics(),
             KeyCode::Char('?') => self.help = true,
             KeyCode::Char('/') => self.input = Some(Input::Search(self.query.clone())),
-            KeyCode::Char('F') => self.input = Some(Input::Filter(self.page.filter.clone())),
             KeyCode::Tab if matches!(self.page.kind, PageKind::Search) => {
                 self.search_kind = self.search_kind.next();
                 self.search();
             }
-            KeyCode::Esc | KeyCode::Char('q') => return Ok(self.back()),
+            KeyCode::Esc => return Ok(self.back()),
             KeyCode::Up | KeyCode::Char('k') => {
                 self.page.cursor = self.page.cursor.saturating_sub(1)
             }
@@ -893,13 +1109,13 @@ impl App {
             KeyCode::Char('{') => self.player.seek(-60000),
             KeyCode::Char('}') => self.player.seek(60000),
             KeyCode::Char('s') => self.player.shuffle(),
-            KeyCode::Char('R') => self.player.repeat(),
-            KeyCode::Char('N') => {
+            KeyCode::Char('r') => self.player.repeat(),
+            KeyCode::Char('v') => {
                 let mut p = Page::new("Now playing", vec![]);
                 p.kind = PageKind::Playing;
                 self.navigate(p);
             }
-            KeyCode::Char('Q') => {
+            KeyCode::Char('q') => {
                 let mut p = Page::new("Playback queue", vec![]);
                 p.kind = PageKind::Queue;
                 self.navigate(p);
@@ -909,20 +1125,14 @@ impl App {
             KeyCode::Char('t') => self.route(Route::Playlists)?,
             KeyCode::Char('m') => self.route(Route::Mixes)?,
             KeyCode::Char('f') => self.favorite(),
-            KeyCode::Char(action @ ('a' | 'P' | 'd' | 'w')) => {
+            KeyCode::Char(action @ ('a' | 'i' | 'd' | 'w')) => {
                 if let Some(row) = self.selected_row() {
-                    self.collection(row, action);
-                    self.toast("Loading selection…");
-                }
-            }
-            KeyCode::Char('r') => {
-                if let Some(Row::Track(t)) = self.selected_row() {
-                    self.load("Track radio", move |c| {
-                        Ok(JobResult::Page(Page::new(
-                            "Track radio",
-                            c.track_radio(t.id)?.into_iter().map(Row::Track).collect(),
-                        )))
-                    });
+                    if matches!(action, 'a' | 'i') {
+                        self.enqueue_selection(row, action);
+                    } else {
+                        self.collection(row, action);
+                        self.toast("Loading selection…");
+                    }
                 }
             }
             KeyCode::Delete => {
@@ -934,23 +1144,15 @@ impl App {
                     self.edit_playlist(None);
                 }
             }
-            KeyCode::Char(key @ ('J' | 'K')) => {
-                if matches!(self.page.kind, PageKind::Queue) {
-                    if let Some((i, _)) = self.page.selected() {
-                        let to = if key == 'J' {
-                            i + 1
-                        } else {
-                            i.saturating_sub(1)
-                        };
-                        self.player.reorder(i, to);
-                        self.page.cursor = to.min(self.page.rows.len().saturating_sub(1));
-                    }
-                } else if !self.loading {
-                    self.edit_playlist(Some(if key == 'J' { 1 } else { -1 }));
-                }
-            }
             KeyCode::Char('u') => {
-                if let PageKind::Playlist { id, .. } = &self.page.kind {
+                if matches!(self.page.kind, PageKind::Lyrics) {
+                    let s = self.player.snapshot();
+                    if let Some(track) =
+                        s.queue.current.and_then(|i| s.queue.tracks.get(i)).cloned()
+                    {
+                        self.request_lyrics(track, true);
+                    }
+                } else if let PageKind::Playlist { id, .. } = &self.page.kind {
                     let id = id.clone();
                     let title = self.page.title.clone();
                     self.load(title.clone(), move |c| {
@@ -1008,6 +1210,18 @@ impl App {
                     });
                 }
                 Ok(JobResult::Toast(t)) => self.toast(t),
+                Ok(JobResult::QueuedSelection(order, action, result)) => {
+                    self.apply_queued_selection(order, action, result)
+                }
+                Ok(JobResult::Lyrics(id, result)) => {
+                    self.lyrics.insert(
+                        id,
+                        match result {
+                            Ok(lyrics) => LyricsState::Ready(lyrics),
+                            Err(error) => LyricsState::Failed(error),
+                        },
+                    );
+                }
                 Ok(JobResult::PlayAlbum(p, tracks)) => {
                     self.page = p;
                     self.player.play_album(tracks);
@@ -1035,20 +1249,27 @@ impl App {
                             Ok(JobResult::Page(p))
                         },
                     ),
-                    _ => {
-                        let n = tracks.len();
-                        self.player.enqueue(tracks, action == 'P');
-                        self.toast(format!(
-                            "Added {n} tracks {}",
-                            if action == 'P' {
-                                "to play next"
-                            } else {
-                                "to the queue"
-                            }
-                        ));
-                    }
+                    _ => {}
                 },
                 Ok(JobResult::Page(p)) => self.page = p,
+            }
+        }
+    }
+    fn sync_lyrics(&mut self, snapshot: &Snapshot) {
+        if matches!(self.page.kind, PageKind::Lyrics) {
+            let track = snapshot
+                .queue
+                .current
+                .and_then(|i| snapshot.queue.tracks.get(i));
+            if track.map(|t| t.id) != self.lyrics_track {
+                self.page.cursor = 0;
+                self.lyrics_follow = true;
+                if let Some(track) = track {
+                    self.request_lyrics(track.clone(), false);
+                } else {
+                    self.lyrics_track = None;
+                    self.page.title = "Lyrics".into();
+                }
             }
         }
     }
@@ -1061,6 +1282,7 @@ impl App {
                 self.last_config = Instant::now();
             }
             let snapshot = self.player.snapshot();
+            self.sync_lyrics(&snapshot);
             if matches!(self.page.kind, PageKind::Queue) {
                 self.page.rows = snapshot
                     .queue
@@ -1100,6 +1322,73 @@ impl App {
         self.player.save()?;
         Ok(())
     }
+    fn draw_lyrics(&self, f: &mut Frame, area: Rect, s: &Snapshot) {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(crate::styling::BORDER))
+            .title(" LRCLIB · j/k scroll · Tab follow · u retry ");
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        let state = s
+            .queue
+            .current
+            .and_then(|i| s.queue.tracks.get(i))
+            .and_then(|t| self.lyrics.get(&t.id));
+        let text = match state {
+            None => "Start a track to view lyrics.".to_owned(),
+            Some(LyricsState::Loading) => "Loading lyrics…".to_owned(),
+            Some(LyricsState::Failed(error)) => {
+                format!("Could not load lyrics: {error}\nPress u to retry.")
+            }
+            Some(LyricsState::Ready(None)) => "No lyrics found for this recording.".to_owned(),
+            Some(LyricsState::Ready(Some(lyrics))) if lyrics.instrumental => {
+                "Instrumental — no lyrics.".to_owned()
+            }
+            Some(LyricsState::Ready(Some(lyrics))) => {
+                let active = lyrics.active_line(s.position_ms);
+                let lines = lyrics.lines();
+                let mut starts = vec![];
+                let mut rows = vec![];
+                for (i, line) in lines.iter().enumerate() {
+                    starts.push(rows.len());
+                    for row in wrap_lyric(line, inner.width as usize) {
+                        rows.push(
+                            ListItem::new(format!(" {row}")).style(if active == Some(i) {
+                                Style::default()
+                                    .fg(crate::styling::ACCENT)
+                                    .bg(crate::styling::SELECTED)
+                                    .add_modifier(Modifier::BOLD)
+                            } else {
+                                Style::default().fg(crate::styling::FOREGROUND)
+                            }),
+                        );
+                    }
+                }
+                let start = if self.lyrics_follow {
+                    active
+                        .and_then(|i| starts.get(i).copied())
+                        .unwrap_or(0)
+                        .saturating_sub(inner.height as usize / 2)
+                } else {
+                    starts.get(self.page.cursor).copied().unwrap_or(0)
+                };
+                f.render_widget(
+                    List::new(
+                        rows.into_iter()
+                            .skip(start)
+                            .take(inner.height as usize)
+                            .collect::<Vec<_>>(),
+                    ),
+                    inner,
+                );
+                return;
+            }
+        };
+        f.render_widget(
+            Paragraph::new(text).style(Style::default().fg(crate::styling::MUTED)),
+            inner,
+        );
+    }
     fn draw(&self, f: &mut Frame, s: &Snapshot) {
         let area = f.area();
         let accent = crate::styling::ACCENT;
@@ -1130,7 +1419,9 @@ impl App {
                 format!("[filter: {}]", self.page.filter)
             }
         );
-        if matches!(self.page.kind, PageKind::Playing) {
+        if matches!(self.page.kind, PageKind::Lyrics) {
+            self.draw_lyrics(f, chunks[1], s);
+        } else if matches!(self.page.kind, PageKind::Playing) {
             if let Some(t) = s.queue.current.and_then(|i| s.queue.tracks.get(i)) {
                 crate::panel::render(
                     f,
@@ -1279,7 +1570,13 @@ impl App {
             );
         }
         if self.show_hints {
-            f.render_widget(Paragraph::new(" / search · Enter play/open · a queue · P play next · N playing · Q queue · ? keys · Ctrl-q quit").style(dim),chunks[3]);
+            f.render_widget(
+                Paragraph::new(
+                    " / search · a add · i next · v playing · y lyrics · q queue · ? keys",
+                )
+                .style(dim),
+                chunks[3],
+            );
         }
         let message = if self.notice_until > Instant::now() {
             self.notice.clone()
@@ -1309,7 +1606,7 @@ impl App {
                 area.height * 9 / 10,
             );
             f.render_widget(Clear, rect);
-            f.render_widget(Paragraph::new("Navigate: ↑↓ / j k · Enter play/open · Esc/q back · Ctrl-q quit\n/ search · Tab switch tracks/albums/artists · F filter current list\nb home · l library · t playlists · m mixes · N now playing\n\nSpace pause/resume · n/→ next · p/← previous · +/- volume\n[ / ] seek ±10s · { / } seek ±60s · g seek to timestamp (waits for buffering)\ns shuffle · R cycle repeat off/all/one\nQ playback queue · a append selection · P play next\nQueue: Delete remove · J/K move down/up · Enter jump to track\n\nf like/unlike track, save/unsave album, follow/unfollow artist\nw add selection to playlist · c create playlist in playlist browser\nPlaylist tracks: Delete remove · J/K reorder · u reload\nd download selection · r open track radio\n\nPlayback continues while browsing. Saved queues restore paused.\nPress any key to close.")
+            f.render_widget(Paragraph::new("Letters work in either case · Esc back · Ctrl-q quit\n/ search · Tab search type · Ctrl-f filter\nb home · l library · t playlists · m mixes\nv now playing · y lyrics · q queue\n\nSpace pause · n/→ next · p/← previous · +/- volume\n[ / ] seek ±10s · { / } ±60s · g timestamp\ns shuffle · r repeat off/all/one · Ctrl-r radio\n\na add to queue (before album) · i play next\nQueue: Enter play · Delete remove · Ctrl-↑/↓ reorder\nf favourite track/album/artist · w add to playlist\nc create playlist · u reload · d download\nPlaylist: Delete remove · Ctrl-↑/↓ reorder\n\nLyrics: j/k scroll · Tab follow · u retry\nPlayback continues while browsing.\nPress any key to close.")
                 .block(Block::default().borders(Borders::ALL).title("Key bindings").border_style(Style::default().fg(accent))),rect);
         }
     }
@@ -1344,6 +1641,12 @@ mod tests {
             last_config: Instant::now(),
             redraw: false,
             show_hints: true,
+            lyrics: HashMap::new(),
+            lyrics_track: None,
+            lyrics_follow: true,
+            queue_request: 0,
+            queue_apply: 0,
+            queue_results: BTreeMap::new(),
         }
     }
     fn key(code: KeyCode) -> KeyEvent {
@@ -1372,7 +1675,8 @@ mod tests {
             .map(Row::Track)
             .collect();
         app.key(key(KeyCode::Down)).unwrap();
-        app.key(key(KeyCode::Char('J'))).unwrap();
+        app.key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL))
+            .unwrap();
         assert_eq!(app.player.snapshot().queue.tracks[2].id, 2);
         app.key(key(KeyCode::Delete)).unwrap();
         assert_eq!(app.player.snapshot().queue.tracks.len(), 2);
@@ -1395,6 +1699,118 @@ mod tests {
         );
         app.key(key(KeyCode::Char(' '))).unwrap();
         assert!(app.player.snapshot().paused);
+    }
+    #[test]
+    fn queued_albums_and_tracks_keep_request_order_when_loading_finishes_out_of_order() {
+        let mut app = app();
+        app.player.play_album(vec![test_track(1), test_track(2)]);
+        app.apply_queued_selection(1, 'a', Ok(vec![test_track(12)]));
+        assert_eq!(app.player.snapshot().queue.tracks.len(), 2);
+        app.apply_queued_selection(0, 'a', Ok(vec![test_track(10), test_track(11)]));
+        let state = app.player.snapshot();
+        assert_eq!(
+            state.queue.tracks.iter().map(|t| t.id).collect::<Vec<_>>(),
+            vec![1, 10, 11, 12, 2]
+        );
+        app.apply_queued_selection(3, 'a', Ok(vec![test_track(13)]));
+        app.apply_queued_selection(2, 'a', Err("Selection unavailable".into()));
+        let state = app.player.snapshot();
+        assert_eq!(
+            state.queue.tracks.iter().map(|t| t.id).collect::<Vec<_>>(),
+            vec![1, 10, 11, 12, 13, 2]
+        );
+    }
+    #[test]
+    fn shortcuts_ignore_case_and_text_entry_preserves_case() {
+        for upper in [false, true] {
+            let mut app = app();
+            app.player.play_album(vec![test_track(1), test_track(2)]);
+            let code = |c: char| KeyCode::Char(if upper { c.to_ascii_uppercase() } else { c });
+            app.key(key(code('v'))).unwrap();
+            assert!(matches!(app.page.kind, PageKind::Playing));
+            app.key(key(code('q'))).unwrap();
+            assert!(matches!(app.page.kind, PageKind::Queue));
+            app.key(key(code('n'))).unwrap();
+            assert_eq!(app.player.snapshot().queue.current, Some(1));
+            app.key(key(code('p'))).unwrap();
+            assert_eq!(app.player.snapshot().queue.current, Some(0));
+            app.key(key(code('r'))).unwrap();
+            assert_eq!(
+                app.player.snapshot().queue.repeat,
+                crate::player::Repeat::All
+            );
+            app.key(KeyEvent::new(code('f'), KeyModifiers::CONTROL))
+                .unwrap();
+            assert!(matches!(app.input, Some(Input::Filter(_))));
+            app.key(key(KeyCode::Esc)).unwrap();
+            app.key(key(KeyCode::Char('/'))).unwrap();
+            for c in "MiXeD".chars() {
+                app.key(key(KeyCode::Char(c))).unwrap();
+            }
+            assert!(matches!(&app.input,Some(Input::Search(text))if text=="MiXeD"));
+            app.key(key(KeyCode::Esc)).unwrap();
+            assert!(app
+                .key(KeyEvent::new(code('q'), KeyModifiers::CONTROL))
+                .unwrap());
+        }
+        for c in 'a'..='z' {
+            assert_eq!(
+                crate::keys::command(key(KeyCode::Char(c.to_ascii_uppercase()))).code,
+                KeyCode::Char(c)
+            );
+        }
+    }
+    #[test]
+    fn lyrics_view_highlights_and_scrolls_without_interrupting_playback() {
+        let mut app = app();
+        app.player.play_album(vec![test_track(1), test_track(2)]);
+        app.lyrics.insert(
+            1,
+            LyricsState::Ready(Some(crate::lyrics::Lyrics {
+                plain: String::new(),
+                synced: crate::lyrics::parse_lrc("[00:00.00]First line\n[00:02.00]Second line"),
+                instrumental: false,
+            })),
+        );
+        app.key(key(KeyCode::Char('Y'))).unwrap();
+        assert!(matches!(app.page.kind, PageKind::Lyrics));
+        assert!(!app.player.snapshot().paused);
+        app.key(key(KeyCode::Char('J'))).unwrap();
+        assert!(!app.lyrics_follow);
+        assert_eq!(app.page.cursor, 1);
+        app.key(key(KeyCode::Tab)).unwrap();
+        assert!(app.lyrics_follow);
+        let mut state = app.player.snapshot();
+        state.position_ms = 2500;
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| app.draw(f, &state)).unwrap();
+        assert!(terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .any(|c| c.symbol() == "S" && c.bg == crate::styling::SELECTED));
+        for (w, h) in [(1, 1), (15, 6)] {
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+            terminal.draw(|f| app.draw(f, &state)).unwrap();
+        }
+        app.lyrics.insert(
+            2,
+            LyricsState::Ready(Some(crate::lyrics::Lyrics {
+                plain: "Next track lyrics".into(),
+                synced: vec![],
+                instrumental: false,
+            })),
+        );
+        app.key(key(KeyCode::Char('N'))).unwrap();
+        let next = app.player.snapshot();
+        app.sync_lyrics(&next);
+        assert_eq!(app.lyrics_track, Some(2));
+        assert!(app.lyrics_follow);
+        assert!(app.page.title.contains("Track 2"));
+        assert!(!app.player.snapshot().paused);
+        app.key(key(KeyCode::Esc)).unwrap();
+        assert!(matches!(app.page.kind, PageKind::Home));
     }
     #[test]
     fn renders_empty_lists_help_and_now_playing_at_small_sizes() {
