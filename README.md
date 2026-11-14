@@ -31,7 +31,8 @@ Press `?` for key bindings. Search with `/`, change search type with `Tab`, and 
 - Complete paginated albums, playlists, mixes, and library collections.
 - Queue, track position, shuffle, and repeat saved every five seconds and on exit. Restored sessions start paused; `Space` resumes.
 - Startup album command that opens the TUI and immediately plays the full album in order.
-- Automatic Noctalia/Pywal colour integration with live palette reload and terminal palette fallback.
+- A fixed deep-red interface, with warm text, burgundy selection highlights, and natural album artwork.
+- The next queued track is prepared while the current track plays, reducing gaps between tracks.
 - Existing Tidal streaming, Braille cover art, spectrum/beat visuals, media keys, radio, local file playback, and background downloads.
 
 ## Requirements
@@ -197,7 +198,7 @@ Replace the example ID and terminal with your choices. Authenticate to Tidal onc
 
 Seeking waits for the current file to finish buffering. Queue changes are local; playlist and favourite changes are sent to Tidal. Tidal permissions and subscription availability still apply. Errors appear in the footer; failed changes are not shown as successful.
 
-Open Config from the home screen to change settings with `Enter`; booleans toggle immediately and theme modes cycle. Only folder paths need text entry. The standalone local-file player keeps its existing controls.
+Open Config from the home screen to change settings with `Enter`; booleans toggle immediately. Only folder paths need text entry. The standalone local-file player keeps its existing controls.
 
 ## Configuration
 
@@ -211,27 +212,9 @@ Run `lumitide config` to open the JSON file in your editor, or choose Config in 
 | `cover_size` | `640` | Album art fetch size in pixels |
 | `search_limit` | `10` | Default number of search results |
 | `drop_detection` | `true` | Enable beat/drop detection and color cycling |
-| `always_color` | `true` | Always show album-art colors (not only during drops) |
-| `theme` | `"auto"` | `auto`, `noctalia`, `pywal`, `terminal`, or `album` |
-| `theme_file` | `null` | Optional generated colour JSON path, with `~/` support |
-| `pywal` | `false` | Use [Pywal](https://github.com/dylanaraps/pywal) palette instead of album-art colors (reads `~/.cache/wal/colors.json` on all platforms) |
+| `always_color` | `true` | Keep artwork and red visualization accents coloured between drops |
 | `calm_mode` | `false` | Static spectrum shape, no drop/beat effects |
 | `show_controls_hint` | `true` | Show "Press ? for ctrl" hint in the corner |
-
-### Noctalia, Hyprland, and CachyOS colours
-
-Hyprland itself does not prescribe a colour scheme. Lumitide follows the files produced by the desktop's theming tools. The default `"theme": "auto"` checks:
-
-1. `theme_file`, if set.
-2. `$NOCTALIA_CONFIG_DIR/colors.json`, then `$XDG_CONFIG_HOME/noctalia/colors.json` (normally `~/.config/noctalia/colors.json`), then the Noctalia cache directory.
-3. Pywal's `colors.json` in the XDG cache or `~/.cache/wal/`.
-4. The terminal's current ANSI palette.
-
-Noctalia's `mPrimary`, `mSecondary`, `mTertiary`, `mSurface`, `mOnSurface`, and `mOnSurfaceVariant` colours are supported directly. Flat Material colour JSON and Matugen JSON exports are also accepted. Files are reloaded once per second; wallpaper/theme changes do not require restarting Lumitide. Malformed/missing files fall back safely.
-
-If your Noctalia version themes Kitty/Alacritty/Foot rather than exporting `colors.json`, choose `"theme": "terminal"` to inherit its terminal palette. For another generated JSON file, set `"theme_file": "~/path/to/colors.json"`. No desktop files are modified and no hooks need to be installed. The legacy `pywal: true` setting still explicitly selects Pywal; disable it to use Noctalia auto-detection.
-
-Album art retains its own colours with `"theme": "album"`; desktop palettes recolour the art and visualizer when available. Media keys and MPRIS metadata/progress remain available to Noctalia's media widget.
 
 ## Performance
 

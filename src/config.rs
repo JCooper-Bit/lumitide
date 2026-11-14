@@ -12,10 +12,6 @@ fn config_path() -> PathBuf {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
-    #[serde(default)]
-    pub theme: crate::theme::Mode,
-    #[serde(default)]
-    pub theme_file: Option<String>,
     #[serde(default = "default_search_limit")]
     pub search_limit: u32,
     #[serde(default = "default_output_dir")]
@@ -26,10 +22,8 @@ pub struct Config {
     pub volume: f32,
     #[serde(default = "default_true")]
     pub drop_detection: bool,
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub always_color: bool,
-    #[serde(default)]
-    pub pywal: bool,
     #[serde(default)]
     pub calm_mode: bool,
     #[serde(default = "default_true")]
@@ -55,15 +49,12 @@ fn default_true() -> bool {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            theme: crate::theme::Mode::Auto,
-            theme_file: None,
             search_limit: 10,
             output_dir: ".".to_string(),
             cover_size: 640,
             volume: 0.5,
             drop_detection: true,
             always_color: true,
-            pywal: false,
             calm_mode: false,
             show_controls_hint: true,
         }
@@ -161,6 +152,7 @@ mod tests {
         assert!((cfg.volume - 0.8).abs() < 1e-6);
         assert_eq!(cfg.search_limit, 10);
         assert_eq!(cfg.output_dir, ".");
+        assert!(cfg.always_color);
     }
 
     #[test]
@@ -208,10 +200,6 @@ pub fn edit_interactive() -> Result<()> {
             format!(
                 "Always color        {}",
                 if cfg.always_color { "on" } else { "off" }
-            ),
-            format!(
-                "Pywal colors        {}",
-                if cfg.pywal { "on" } else { "off" }
             ),
             format!(
                 "Calm mode           {}",
@@ -288,20 +276,13 @@ pub fn edit_interactive() -> Result<()> {
                 save(&cfg)?;
             }
             4 => {
-                cfg.pywal = Confirm::new()
-                    .with_prompt("Pywal colors")
-                    .default(cfg.pywal)
-                    .interact()?;
-                save(&cfg)?;
-            }
-            5 => {
                 cfg.calm_mode = Confirm::new()
                     .with_prompt("Calm mode")
                     .default(cfg.calm_mode)
                     .interact()?;
                 save(&cfg)?;
             }
-            6 => {
+            5 => {
                 cfg.show_controls_hint = Confirm::new()
                     .with_prompt("Controls hint")
                     .default(cfg.show_controls_hint)
@@ -339,14 +320,4 @@ pub fn open_editor() -> Result<()> {
 
 pub fn directory() -> std::path::PathBuf {
     config_path().parent().unwrap().to_owned()
-}
-
-pub fn expand_theme_path(path: &str) -> String {
-    if let Some(rest) = path.strip_prefix("~/") {
-        dirs::home_dir()
-            .map(|p| p.join(rest).to_string_lossy().into_owned())
-            .unwrap_or_else(|| path.into())
-    } else {
-        path.into()
-    }
 }

@@ -208,6 +208,7 @@ impl From<RawTrack> for TrackInfo {
 
 // ─── Client ───────────────────────────────────────────────────────────────────
 
+#[derive(Clone)]
 pub struct TidalClient {
     pub session: Session,
     client: reqwest::blocking::Client,

@@ -114,3 +114,57 @@ impl Drop for Server {
         }
     }
 }
+
+impl Server {
+    pub fn audio(count: usize) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let requests = Arc::new(Mutex::new(vec![]));
+        let log = requests.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let shutdown = stop.clone();
+        let worker = thread::spawn(move || {
+            for _ in 0..count {
+                let mut stream = loop {
+                    if shutdown.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    match listener.accept() {
+                        Ok((s, _)) => break s,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(5))
+                        }
+                        Err(e) => panic!("{e}"),
+                    }
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut bytes = [0u8; 4096];
+                let n = stream.read(&mut bytes).unwrap();
+                log.lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&bytes[..n]).into_owned());
+                let audio = include_bytes!("../tests/fixtures/silence.flac");
+                let header=format!("HTTP/1.1 200 OK\r\nContent-Type: audio/flac\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",audio.len());
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(audio);
+            }
+        });
+        Self {
+            url,
+            requests,
+            stop,
+            worker: Some(worker),
+        }
+    }
+}
+pub fn manifest(url: &str) -> Reply {
+    use base64::Engine;
+    let manifest = base64::engine::general_purpose::STANDARD
+        .encode(serde_json::json!({"urls":[url],"encryptionType":"NONE"}).to_string());
+    Reply::json(
+        serde_json::json!({"manifestMimeType":"application/vnd.tidal.bts","manifest":manifest}),
+    )
+}

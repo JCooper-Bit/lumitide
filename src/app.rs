@@ -11,7 +11,7 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Layout, Rect},
     style::{Modifier, Style},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
+    widgets::{Block, Borders, Clear, Gauge, List, ListItem, Paragraph},
     Frame, Terminal,
 };
 use std::collections::HashSet;
@@ -74,7 +74,6 @@ enum Route {
 enum Setting {
     Folder,
     Limit,
-    Theme,
     Drops,
     Colors,
     Calm,
@@ -201,8 +200,7 @@ struct App {
     notice: String,
     notice_until: Instant,
     last_save: Instant,
-    theme: crate::theme::Theme,
-    last_theme: Instant,
+    last_config: Instant,
     redraw: bool,
     show_hints: bool,
 }
@@ -242,10 +240,6 @@ fn settings() -> Page {
             Row::Setting(
                 format!("Search limit: {} (Enter +10)", c.search_limit),
                 Setting::Limit,
-            ),
-            Row::Setting(
-                format!("Theme: {:?} (Enter cycles)", c.theme),
-                Setting::Theme,
             ),
             Row::Setting(
                 format!("Drop detection: {}", c.drop_detection),
@@ -390,8 +384,7 @@ pub fn run(client: TidalClient, start: Start) -> Result<()> {
         notice: String::new(),
         notice_until: Instant::now(),
         last_save: Instant::now(),
-        theme: crate::theme::load(&crate::config::load()),
-        last_theme: Instant::now(),
+        last_config: Instant::now(),
         redraw: false,
         show_hints: true,
     };
@@ -419,6 +412,7 @@ struct Screen {
 }
 impl Screen {
     fn new() -> Result<Self> {
+        crossterm::style::force_color_output(true);
         enable_raw_mode()?;
         let result = (|| {
             let mut stdout = io::stdout();
@@ -643,10 +637,6 @@ impl App {
                             (cfg.search_limit + 10).min(100)
                         }
                     }
-                    Setting::Theme => {
-                        cfg.theme = cfg.theme.next();
-                        cfg.pywal = false;
-                    }
                     Setting::Drops => cfg.drop_detection = !cfg.drop_detection,
                     Setting::Colors => cfg.always_color = !cfg.always_color,
                     Setting::Calm => cfg.calm_mode = !cfg.calm_mode,
@@ -656,7 +646,6 @@ impl App {
                 let cursor = self.page.cursor;
                 self.page = settings();
                 self.page.cursor = cursor;
-                self.theme = crate::theme::load(&cfg);
                 self.limit = cfg.search_limit.clamp(1, 100);
             }
             Row::Track(_) => {
@@ -1066,11 +1055,10 @@ impl App {
     fn event_loop(&mut self, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
         loop {
             self.completions();
-            if self.last_theme.elapsed() > Duration::from_secs(1) {
+            if self.last_config.elapsed() > Duration::from_secs(1) {
                 let cfg = crate::config::load();
                 self.show_hints = cfg.show_controls_hint;
-                self.theme = crate::theme::load(&cfg);
-                self.last_theme = Instant::now();
+                self.last_config = Instant::now();
             }
             let snapshot = self.player.snapshot();
             if matches!(self.page.kind, PageKind::Queue) {
@@ -1114,20 +1102,13 @@ impl App {
     }
     fn draw(&self, f: &mut Frame, s: &Snapshot) {
         let area = f.area();
-        let accent = if self.theme.source == "album" {
-            s.visual
-                .color
-                .map(|(r, g, b)| ratatui::style::Color::Rgb(r, g, b))
-                .unwrap_or(self.theme.accent)
-        } else {
-            self.theme.accent
-        };
-        let dim = Style::default().fg(self.theme.muted);
+        let accent = crate::styling::ACCENT;
+        let dim = Style::default().fg(crate::styling::MUTED);
         f.render_widget(
             Block::default().style(
                 Style::default()
-                    .fg(self.theme.foreground)
-                    .bg(self.theme.background),
+                    .fg(crate::styling::FOREGROUND)
+                    .bg(crate::styling::BACKGROUND),
             ),
             area,
         );
@@ -1140,15 +1121,14 @@ impl App {
         ])
         .split(area);
         let header = format!(
-            " {}{}  {} · theme {}",
+            " L U M I T I D E   /   {}{}  {}",
             self.page.title,
             if self.loading { " · loading…" } else { "" },
             if self.page.filter.is_empty() {
                 String::new()
             } else {
                 format!("[filter: {}]", self.page.filter)
-            },
-            self.theme.source
+            }
         );
         if matches!(self.page.kind, PageKind::Playing) {
             if let Some(t) = s.queue.current.and_then(|i| s.queue.tracks.get(i)) {
@@ -1181,7 +1161,7 @@ impl App {
             }
         } else {
             let visible = self.page.visible();
-            let height = chunks[1].height as usize;
+            let height = chunks[1].height.saturating_sub(2) as usize;
             let start = self.page.cursor.saturating_sub(height.saturating_sub(1));
             let rows: Vec<_> = visible
                 .iter()
@@ -1203,7 +1183,10 @@ impl App {
                         row.label()
                     );
                     ListItem::new(label).style(if pos == self.page.cursor {
-                        Style::default().fg(accent).add_modifier(Modifier::BOLD)
+                        Style::default()
+                            .fg(crate::styling::FOREGROUND)
+                            .bg(crate::styling::SELECTED)
+                            .add_modifier(Modifier::BOLD)
                     } else {
                         Style::default()
                     })
@@ -1220,11 +1203,30 @@ impl App {
                     chunks[1],
                 );
             } else {
-                f.render_widget(List::new(rows), chunks[1]);
+                f.render_widget(
+                    List::new(rows).block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_style(Style::default().fg(crate::styling::BORDER))
+                            .title(format!(" {} items ", visible.len())),
+                    ),
+                    chunks[1],
+                );
             }
         }
         f.render_widget(
-            Paragraph::new(header).style(Style::default().fg(accent).add_modifier(Modifier::BOLD)),
+            Paragraph::new(header)
+                .style(
+                    Style::default()
+                        .fg(accent)
+                        .bg(crate::styling::SURFACE)
+                        .add_modifier(Modifier::BOLD),
+                )
+                .block(
+                    Block::default()
+                        .borders(Borders::BOTTOM)
+                        .border_style(Style::default().fg(crate::styling::BORDER)),
+                ),
             chunks[0],
         );
         let status = if let Some(t) = s.queue.current.and_then(|i| s.queue.tracks.get(i)) {
@@ -1252,9 +1254,30 @@ impl App {
             )
         };
         f.render_widget(
-            Paragraph::new(status).style(Style::default().fg(accent)),
+            Paragraph::new(status).style(
+                Style::default()
+                    .fg(crate::styling::FOREGROUND)
+                    .bg(crate::styling::SURFACE),
+            ),
             chunks[2],
         );
+        if chunks[2].height > 1 {
+            let ratio = s
+                .queue
+                .current
+                .and_then(|i| s.queue.tracks.get(i))
+                .filter(|t| t.duration > 0)
+                .map(|t| (s.position_ms as f64 / (t.duration as f64 * 1000.0)).clamp(0.0, 1.0))
+                .unwrap_or(0.0);
+            let bar = Rect::new(chunks[2].x, chunks[2].y + 1, chunks[2].width, 1);
+            f.render_widget(
+                Gauge::default()
+                    .ratio(ratio)
+                    .label("")
+                    .gauge_style(Style::default().fg(accent).bg(crate::styling::SELECTED)),
+                bar,
+            );
+        }
         if self.show_hints {
             f.render_widget(Paragraph::new(" / search · Enter play/open · a queue · P play next · N playing · Q queue · ? keys · Ctrl-q quit").style(dim),chunks[3]);
         }
@@ -1318,8 +1341,7 @@ mod tests {
             notice: String::new(),
             notice_until: Instant::now(),
             last_save: Instant::now(),
-            theme: crate::theme::Theme::default(),
-            last_theme: Instant::now(),
+            last_config: Instant::now(),
             redraw: false,
             show_hints: true,
         }
@@ -1390,6 +1412,54 @@ mod tests {
                         .unwrap();
                 }
             }
+        }
+    }
+    #[test]
+    fn fixed_red_interface_has_readable_selection_and_progress() {
+        let mut app = app();
+        let mut tracks = vec![test_track(1), test_track(2), test_track(3), test_track(4)];
+        for (t, name) in
+            tracks
+                .iter_mut()
+                .zip(["Speak to Me", "Breathe (In the Air)", "On the Run", "Time"])
+        {
+            t.title = name.into();
+            t.artist_name = "Pink Floyd".into();
+            t.album_name = "The Dark Side of the Moon".into();
+        }
+        app.page = Page::new(
+            "The Dark Side of the Moon",
+            tracks.iter().cloned().map(Row::Track).collect(),
+        );
+        app.page.cursor = 1;
+        app.player.play(tracks, 1);
+        let mut snapshot = app.player.snapshot();
+        snapshot.position_ms = 65000;
+        snapshot.loading = false;
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 28)).unwrap();
+        terminal.draw(|f| app.draw(f, &snapshot)).unwrap();
+        let buffer = terminal.backend().buffer();
+        assert!(buffer
+            .content
+            .iter()
+            .any(|c| c.bg == crate::styling::SELECTED
+                && c.fg == crate::styling::FOREGROUND
+                && c.symbol() == "B"));
+        assert!(buffer
+            .content
+            .iter()
+            .any(|c| c.fg == crate::styling::ACCENT));
+        if let Ok(path) = std::env::var("LUMITIDE_TEST_RENDER") {
+            let pixels:Vec<_>=buffer.content.iter().map(|c|{
+                let rgb=|color:ratatui::style::Color,default:(u8,u8,u8)|match color{ratatui::style::Color::Rgb(r,g,b)=>(r,g,b),_=>default};
+                serde_json::json!({"text":c.symbol(),"fg":rgb(c.fg,(241,226,220)),"bg":rgb(c.bg,(19,10,14))})
+            }).collect();
+            std::fs::write(
+                path,
+                serde_json::to_vec(&serde_json::json!({"width":100,"height":28,"cells":pixels}))
+                    .unwrap(),
+            )
+            .unwrap();
         }
     }
     #[test]

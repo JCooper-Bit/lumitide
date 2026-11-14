@@ -86,6 +86,21 @@ impl Queue {
         self.history.push(i);
         self.current = next;
     }
+    fn upcoming(&self) -> Option<&TrackInfo> {
+        let current = self.current?;
+        let next = if self.repeat == Repeat::One {
+            Some(current)
+        } else if self.shuffle {
+            self.remaining.last().copied()
+        } else if current + 1 < self.tracks.len() {
+            Some(current + 1)
+        } else if self.repeat == Repeat::All {
+            Some(0)
+        } else {
+            None
+        };
+        next.and_then(|i| self.tracks.get(i))
+    }
     pub fn previous(&mut self) {
         if let Some(i) = self.history.pop() {
             if let Some(current) = self.current {
@@ -186,6 +201,7 @@ pub struct Transport {
     pub generation: u64,
     pub stop: Arc<AtomicBool>,
     pub paused: AtomicBool,
+    pub started: AtomicBool,
     pub seek_ms: AtomicU64,
     pub position_ms: AtomicU64,
     pub volume: Arc<Mutex<f32>>,
@@ -203,6 +219,7 @@ impl Transport {
             generation,
             stop: Arc::new(AtomicBool::new(false)),
             paused: AtomicBool::new(paused),
+            started: AtomicBool::new(false),
             seek_ms: AtomicU64::new(if position > 0 { position } else { u64::MAX }),
             position_ms: AtomicU64::new(position),
             volume,
@@ -240,6 +257,8 @@ pub struct Player {
     shutdown: Arc<AtomicBool>,
     volume: Arc<Mutex<f32>>,
     worker: Option<thread::JoinHandle<()>>,
+    prefetcher: Option<thread::JoinHandle<()>>,
+    cache: Arc<crate::buffering::PlaybackCache>,
     save_path: Option<std::path::PathBuf>,
 }
 fn state_path() -> std::path::PathBuf {
@@ -262,7 +281,12 @@ impl Player {
         mut client: TidalClient,
         mut saved: SavedPlayer,
         save_path: Option<std::path::PathBuf>,
-        runner: fn(&mut TidalClient, &TrackInfo, Arc<Transport>) -> Result<String>,
+        runner: fn(
+            &mut TidalClient,
+            &TrackInfo,
+            Arc<Transport>,
+            Arc<crate::buffering::PlaybackCache>,
+        ) -> Result<String>,
     ) -> Self {
         if saved
             .queue
@@ -302,6 +326,53 @@ impl Player {
             shutdown.clone(),
             volume.clone(),
         );
+        let cache = Arc::new(crate::buffering::PlaybackCache::default());
+        let playback_cache = cache.clone();
+        let (prefetch_state, prefetch_transport, prefetch_stop, prefetch_cache, prefetch_client) = (
+            state.clone(),
+            transport.clone(),
+            shutdown.clone(),
+            cache.clone(),
+            client.clone(),
+        );
+        let prefetcher = thread::spawn(move || {
+            while !prefetch_stop.load(Ordering::Relaxed) {
+                let wanted = {
+                    let s = prefetch_state.lock().unwrap();
+                    let current = if s.active {
+                        s.saved
+                            .queue
+                            .current
+                            .and_then(|i| s.saved.queue.tracks.get(i))
+                    } else {
+                        None
+                    };
+                    if let Some(current) = current {
+                        let next = s.saved.queue.upcoming().cloned();
+                        let mut ids = vec![current.id];
+                        if let Some(next) = &next {
+                            ids.push(next.id);
+                        }
+                        prefetch_cache.retain(&ids);
+                        Some((s.generation, current.id, next))
+                    } else {
+                        prefetch_cache.cancel_all();
+                        None
+                    }
+                };
+                if let Some((generation, current, Some(next))) = wanted {
+                    let transport = prefetch_transport.lock().unwrap().clone();
+                    if transport.generation == generation
+                        && transport.started.load(Ordering::Acquire)
+                        && prefetch_cache.contains(current)
+                    {
+                        let _ = prefetch_cache.preload(&prefetch_client, &next);
+                    }
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            prefetch_cache.cancel_all();
+        });
         let worker = thread::spawn(move || {
             while !stop.load(Ordering::Relaxed) {
                 let pending = {
@@ -332,7 +403,7 @@ impl Player {
                         let session = crate::auth::refreshed_session(&client.session)?;
                         client = TidalClient::new(session);
                     }
-                    runner(&mut client, &track, ctl.clone())
+                    runner(&mut client, &track, ctl.clone(), playback_cache.clone())
                 })();
                 let mut s = s.lock().unwrap();
                 if s.generation != generation {
@@ -372,13 +443,21 @@ impl Player {
             shutdown,
             volume,
             worker: Some(worker),
+            prefetcher: Some(prefetcher),
+            cache,
             save_path,
         }
     }
     #[cfg(test)]
     pub fn for_test() -> Self {
-        fn fake(_: &mut TidalClient, _: &TrackInfo, ctl: Arc<Transport>) -> Result<String> {
+        fn fake(
+            _: &mut TidalClient,
+            _: &TrackInfo,
+            ctl: Arc<Transport>,
+            _: Arc<crate::buffering::PlaybackCache>,
+        ) -> Result<String> {
             ctl.visual.lock().unwrap().cover = vec![Line::raw("cover")];
+            ctl.started.store(true, Ordering::Release);
             while !ctl.stop.load(Ordering::Relaxed) {
                 let seek = ctl.seek_ms.swap(u64::MAX, Ordering::Relaxed);
                 if seek != u64::MAX {
@@ -424,7 +503,7 @@ impl Player {
             } else {
                 s.paused || !s.active
             },
-            loading: s.active && visual.cover.is_empty(),
+            loading: s.active && (!installed || !ctl.started.load(Ordering::Acquire)),
             error,
             visual,
             volume,
@@ -597,6 +676,10 @@ impl Drop for Player {
             .unwrap()
             .stop
             .store(true, Ordering::Relaxed);
+        self.cache.cancel_all();
+        if let Some(prefetcher) = self.prefetcher.take() {
+            let _ = prefetcher.join();
+        }
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
@@ -653,7 +736,12 @@ mod tests {
     #[test]
     fn worker_plays_full_album_in_order_and_restart_restores_paused() {
         static VISITED: Mutex<Vec<u64>> = Mutex::new(Vec::new());
-        fn finish(_: &mut TidalClient, t: &TrackInfo, _: Arc<Transport>) -> Result<String> {
+        fn finish(
+            _: &mut TidalClient,
+            t: &TrackInfo,
+            _: Arc<Transport>,
+            _: Arc<crate::buffering::PlaybackCache>,
+        ) -> Result<String> {
             VISITED.lock().unwrap().push(t.id);
             Ok("end".into())
         }
@@ -698,6 +786,78 @@ mod tests {
         assert!(state.paused);
     }
 
+    #[test]
+    fn next_track_is_prepared_before_current_playback_finishes() {
+        use crate::test_support::{manifest, Server};
+        let cdn = Server::audio(2);
+        let api = Server::new(vec![manifest(&cdn.url), manifest(&cdn.url)]);
+        fn hold(
+            c: &mut TidalClient,
+            track: &TrackInfo,
+            ctl: Arc<Transport>,
+            cache: Arc<crate::buffering::PlaybackCache>,
+        ) -> Result<String> {
+            let item = cache.prepare(c, track)?;
+            while !item.ready.load(Ordering::Acquire) {
+                if ctl.stop.load(Ordering::Relaxed) {
+                    return Ok("quit".into());
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            ctl.started.store(true, Ordering::Release);
+            *ctl.visual.lock().unwrap() = Visual {
+                cover: vec![Line::raw("cover")],
+                ..Visual::default()
+            };
+            while !ctl.stop.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_millis(5));
+            }
+            Ok("quit".into())
+        }
+        let player = Player::with_saved(api.client(), SavedPlayer::default(), None, hold);
+        player.play_album(vec![test_track(1), test_track(2)]);
+        let start = std::time::Instant::now();
+        while cdn.requests.lock().unwrap().len() < 2 && start.elapsed() < Duration::from_secs(3) {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            cdn.requests.lock().unwrap().len(),
+            2,
+            "next track was not preloaded"
+        );
+        assert_eq!(
+            player.snapshot().queue.current,
+            Some(0),
+            "current playback should still be running"
+        );
+        player.next();
+        let start = std::time::Instant::now();
+        while player.snapshot().loading && start.elapsed() < Duration::from_secs(3) {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(player.snapshot().queue.current, Some(1));
+        assert!(!player.snapshot().loading);
+        assert_eq!(
+            api.requests.lock().unwrap().len(),
+            2,
+            "preloaded stream should be reused"
+        );
+    }
+    #[test]
+    fn preload_prediction_matches_playback_for_shuffle_repeat_and_play_next() {
+        for repeat in [Repeat::Off, Repeat::All, Repeat::One] {
+            let mut q = Queue::default();
+            q.replace(tracks(5), 2);
+            q.repeat = repeat;
+            for shuffle in [false, true] {
+                q.shuffle = shuffle;
+                let predicted = q.upcoming().map(|t| t.id);
+                let mut actual = q.clone();
+                actual.advance(true);
+                assert_eq!(predicted, actual.current.map(|i| actual.tracks[i].id));
+            }
+        }
+    }
     #[test]
     fn edits_preserve_current_track_and_insert_next() {
         let mut q = Queue::default();

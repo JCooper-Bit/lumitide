@@ -15,12 +15,7 @@ use crossterm::{
         LeaveAlternateScreen,
     },
 };
-use ratatui::{
-    backend::CrosstermBackend,
-    style::{Color, Style},
-    text::{Line, Span},
-    Terminal,
-};
+use ratatui::{backend::CrosstermBackend, Terminal};
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::DecoderOptions;
 use symphonia::core::formats::FormatOptions;
@@ -35,7 +30,6 @@ use crate::cover::{render_cover, render_placeholder, ART_CHARS};
 use crate::panel::{self, PanelState};
 use crate::spectrum::{self, FFT_SIZE, NUM_BARS};
 
-const BUFFER_THRESHOLD: u64 = 65_536;
 const DROP_DURATION_SECS: f64 = 10.0;
 const TARGET_SR: u32 = 22_050;
 
@@ -64,6 +58,7 @@ fn vol_down(v: f32) -> f32 {
 type AppTerminal = Terminal<CrosstermBackend<io::Stdout>>;
 
 fn setup_terminal() -> Result<AppTerminal> {
+    crossterm::style::force_color_output(true);
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, Clear(ClearType::All), EnterAlternateScreen)?;
@@ -73,38 +68,6 @@ fn setup_terminal() -> Result<AppTerminal> {
 fn teardown_terminal(terminal: &mut AppTerminal) {
     let _ = disable_raw_mode();
     let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
-}
-
-/// Remap every braille-cell colour in a cover to the nearest palette entry.
-/// This gives the cover art a "pywal-themed" look matching the UI chrome.
-fn remap_cover_to_palette(lines: &[Line<'static>], palette: &[(u8, u8, u8)]) -> Vec<Line<'static>> {
-    lines
-        .iter()
-        .map(|line| {
-            let spans: Vec<Span<'static>> = line
-                .spans
-                .iter()
-                .map(|span| {
-                    let new_color = if let Some(Color::Rgb(r, g, b)) = span.style.fg {
-                        let &(pr, pg, pb) = palette
-                            .iter()
-                            .min_by_key(|&&(pr, pg, pb)| {
-                                let dr = r as i32 - pr as i32;
-                                let dg = g as i32 - pg as i32;
-                                let db = b as i32 - pb as i32;
-                                dr * dr + dg * dg + db * db
-                            })
-                            .unwrap_or(&(255, 255, 255));
-                        Color::Rgb(pr, pg, pb)
-                    } else {
-                        span.style.fg.unwrap_or(Color::White)
-                    };
-                    Span::styled(span.content.clone(), Style::new().fg(new_color))
-                })
-                .collect();
-            Line::from(spans)
-        })
-        .collect()
 }
 
 /// Register with the OS media controls (SMTC / MPRIS / MPRemoteCommandCenter).
@@ -261,54 +224,38 @@ pub fn run_background(
     client: &mut TidalClient,
     track: &TrackInfo,
     ctl: Arc<crate::player::Transport>,
+    cache: Arc<crate::buffering::PlaybackCache>,
 ) -> Result<String> {
-    let stream = client.stream_url(track.id)?;
+    let prepared = cache.prepare(client, track)?;
+    while !prepared.ready.load(Ordering::Acquire) && !prepared.done.load(Ordering::Acquire) {
+        if ctl.stop.load(Ordering::Relaxed) {
+            return Ok("quit".into());
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
     if ctl.stop.load(Ordering::Relaxed) {
         return Ok("quit".into());
     }
-    let cover = track
-        .album_cover
-        .as_deref()
-        .and_then(|id| client.fetch_cover(id, 320).ok());
-    let tmp = Arc::new(tempfile::Builder::new().suffix(".audio").tempfile()?);
-    let done = Arc::new(AtomicBool::new(false));
-    let ready = Arc::new(AtomicBool::new(false));
-    let bytes = Arc::new(AtomicU64::new(0));
-    let total = Arc::new(AtomicU64::new(0));
-    let (file, d, r, b, t) = (
-        tmp.clone(),
-        done.clone(),
-        ready.clone(),
-        bytes.clone(),
-        total.clone(),
-    );
-    thread::spawn(move || {
-        download_to_file(&stream.url, file.path(), &d, &r, &b, &t, stream.encryption)
-    });
-    while !ready.load(Ordering::Relaxed) && !done.load(Ordering::Relaxed) {
+    if let Some(error) = prepared.error.lock().unwrap().clone() {
+        anyhow::bail!(error);
+    }
+    if prepared.bytes.load(Ordering::Acquire) == 0 {
+        anyhow::bail!("No audio was received from Tidal.");
+    }
+    while ctl.seek_ms.load(Ordering::Relaxed) != u64::MAX && !prepared.done.load(Ordering::Acquire)
+    {
         if ctl.stop.load(Ordering::Relaxed) {
-            done.store(true, Ordering::Relaxed);
             return Ok("quit".into());
         }
-        thread::sleep(Duration::from_millis(30));
+        thread::sleep(Duration::from_millis(10));
     }
-    if bytes.load(Ordering::Relaxed) == 0 {
-        anyhow::bail!("Unable to buffer audio. Check your Tidal session and connection.");
-    }
-    // Resume seeks need a complete file; do not audibly replay the beginning first.
-    while ctl.seek_ms.load(Ordering::Relaxed) != u64::MAX && !done.load(Ordering::Relaxed) {
-        if ctl.stop.load(Ordering::Relaxed) {
-            done.store(true, Ordering::Relaxed);
-            return Ok("quit".into());
-        }
-        thread::sleep(Duration::from_millis(30));
-    }
-    let result = play(
+    let cover = prepared.cover.lock().unwrap().clone();
+    play(
         None,
-        tmp.path(),
-        done.clone(),
-        bytes,
-        total,
+        prepared.file.path(),
+        prepared.done.clone(),
+        prepared.bytes.clone(),
+        prepared.total.clone(),
         track,
         cover.as_deref(),
         false,
@@ -317,9 +264,8 @@ pub fn run_background(
         false,
         false,
         Some(ctl),
-    );
-    done.store(true, Ordering::Relaxed);
-    result
+        Some(prepared.clone()),
+    )
 }
 
 /// Play a local audio file using the same UI.
@@ -358,80 +304,8 @@ pub fn run_local(
         true,
         false,
         None,
+        None,
     )
-}
-
-// ─── Download helper ──────────────────────────────────────────────────────────
-
-fn download_to_file(
-    url: &str,
-    path: &std::path::Path,
-    done: &AtomicBool,
-    header_ready: &AtomicBool,
-    dl_bytes: &AtomicU64,
-    dl_total: &AtomicU64,
-    encryption: Option<crate::api::EncryptionInfo>,
-) {
-    use ctr::cipher::{KeyIvInit, StreamCipher};
-    type Aes128Ctr = ctr::Ctr64BE<aes::Aes128>;
-
-    let mut maybe_cipher = encryption.map(|enc| {
-        let mut iv = [0u8; 16];
-        iv[..8].copy_from_slice(&enc.nonce);
-        Aes128Ctr::new_from_slices(&enc.key, &iv).expect("valid key/iv")
-    });
-
-    let client = reqwest::blocking::Client::builder()
-        .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(120))
-        .build()
-        .unwrap_or_default();
-    let resp = match client.get(url).send() {
-        Ok(r) => r,
-        Err(_) => {
-            done.store(true, Ordering::Relaxed);
-            return;
-        }
-    };
-    if let Some(len) = resp.content_length() {
-        dl_total.store(len, Ordering::Relaxed);
-    }
-    let mut file = match fs::File::create(path) {
-        Ok(f) => f,
-        Err(_) => {
-            done.store(true, Ordering::Relaxed);
-            return;
-        }
-    };
-    use std::io::Write;
-    let mut written: u64 = 0;
-    if let Ok(mut reader) = resp.error_for_status() {
-        let mut buf = vec![0u8; 65_536];
-        loop {
-            if done.load(Ordering::Relaxed) {
-                break;
-            }
-            use std::io::Read;
-            match reader.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    let chunk = &mut buf[..n];
-                    if let Some(ref mut cipher) = maybe_cipher {
-                        cipher.apply_keystream(chunk);
-                    }
-                    let _ = file.write_all(chunk);
-                    written += n as u64;
-                    dl_bytes.store(written, Ordering::Relaxed);
-                    if !header_ready.load(Ordering::Relaxed) && written >= BUFFER_THRESHOLD {
-                        header_ready.store(true, Ordering::Relaxed);
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-    }
-    header_ready.store(true, Ordering::Relaxed);
-    done.store(true, Ordering::Relaxed);
 }
 
 // ─── Core playback + UI loop ──────────────────────────────────────────────────
@@ -450,6 +324,7 @@ fn play(
     is_local: bool,
     already_saved: bool,
     remote: Option<Arc<crate::player::Transport>>,
+    buffered: Option<Arc<crate::buffering::PreparedTrack>>,
 ) -> Result<String> {
     let cfg = config::load();
 
@@ -469,27 +344,17 @@ fn play(
 
     // ── Render cover art (once) ───────────────────────────────────────────────
     let art_chars = if track_label.is_some() { 22 } else { ART_CHARS };
-    let cover_art = cover_bytes
+    let mut cover_art = cover_bytes
         .map(|b| render_cover(b, art_chars))
         .unwrap_or_else(|| render_placeholder(art_chars));
-    let desktop_theme = crate::theme::load(&cfg);
-    let mut palette = if desktop_theme.palette.is_empty() {
-        cover_art.palette.clone()
-    } else {
-        desktop_theme.palette.clone()
-    };
-    let mut pywal_cover: Option<Vec<Line<'static>>> = if !desktop_theme.palette.is_empty() {
-        Some(remap_cover_to_palette(&cover_art.color, &palette))
-    } else {
-        None
-    };
+    let palette = crate::styling::PALETTE.to_vec();
 
     // ── Media controls (SMTC / MPRIS / MPRemoteCommandCenter) ────────────────
     // Write cover bytes to a temp file and pass a file:// URL.
     // HTTPS URLs via CreateFromUri require a message pump for async download;
     // GetFileFromPathAsync blocks synchronously and works without one.
     // Keep _cover_tmp alive for the track duration so the file isn't deleted.
-    let _cover_tmp: Option<tempfile::NamedTempFile> = cover_bytes.and_then(|bytes| {
+    let mut _cover_tmp: Option<tempfile::NamedTempFile> = cover_bytes.and_then(|bytes| {
         use std::io::Write;
         let mut tmp = tempfile::Builder::new().suffix(".jpg").tempfile().ok()?;
         tmp.write_all(bytes).ok()?;
@@ -805,6 +670,9 @@ fn play(
         other => anyhow::bail!("Unsupported output sample format: {other:?}"),
     }?;
     stream.play()?;
+    if let Some(remote) = &remote {
+        remote.started.store(true, Ordering::Release);
+    }
 
     // ── Analysis thread (drop + beat detection) ───────────────────────────────
     if !cfg.calm_mode {
@@ -854,29 +722,38 @@ fn play(
     let mut beat_idx: usize = 0;
     let band_edges = spectrum::compute_band_edges(sample_rate);
 
-    let mut theme_tick = Instant::now();
     let mut media_tick = Instant::now();
+    let mut cover_loaded = cover_bytes.is_some();
     let result_str = loop {
         if let Some(error) = output_error.lock().unwrap().take() {
             anyhow::bail!("Audio output failed: {error}");
         }
-        if theme_tick.elapsed() > Duration::from_secs(1) {
-            let theme = crate::theme::load(&config::load());
-            let next = if theme.palette.is_empty() {
-                cover_art.palette.clone()
-            } else {
-                theme.palette.clone()
-            };
-            if next != palette {
-                palette = next;
-                cs = ColorState::new(palette.clone());
-                pywal_cover = if theme.palette.is_empty() {
-                    None
-                } else {
-                    Some(remap_cover_to_palette(&cover_art.color, &palette))
-                };
+        if let Some(buffered) = &buffered {
+            if let Some(error) = buffered.error.lock().unwrap().clone() {
+                anyhow::bail!(error);
             }
-            theme_tick = Instant::now();
+            if !cover_loaded {
+                if let Some(bytes) = buffered.cover.lock().unwrap().as_ref() {
+                    cover_art = render_cover(bytes, art_chars);
+                    cover_loaded = true;
+                    use std::io::Write;
+                    if let Ok(mut file) = tempfile::Builder::new().suffix(".jpg").tempfile() {
+                        if file.write_all(bytes).is_ok() {
+                            let url = format!("file://{}", file.path().to_string_lossy());
+                            if let Some(mc) = media_controls.as_mut() {
+                                let _ = mc.set_metadata(souvlaki::MediaMetadata {
+                                    title: Some(&track.title),
+                                    artist: Some(&track.artist_name),
+                                    album: Some(&track.album_name),
+                                    duration: Some(Duration::from_secs(track.duration)),
+                                    cover_url: Some(&url),
+                                });
+                            }
+                            _cover_tmp = Some(file);
+                        }
+                    }
+                }
+            }
         }
         if let Some(ctl) = &remote {
             if ctl.stop.load(Ordering::Relaxed) {
@@ -958,7 +835,7 @@ fn play(
 
         let bar_color = cs.current_color();
         let cover_lines = if cs.colors_active() {
-            pywal_cover.as_deref().unwrap_or(&cover_art.color)
+            &cover_art.color
         } else {
             &cover_art.mono
         };
@@ -1015,7 +892,7 @@ fn play(
 
         // ── Keyboard ─────────────────────────────────────────────────────────
         if terminal.is_none() {
-            thread::sleep(Duration::from_millis(90));
+            thread::sleep(Duration::from_millis(25));
         }
         if terminal.is_some() && event::poll(Duration::from_millis(90))? {
             if let Event::Key(key) = event::read()? {
@@ -1682,6 +1559,7 @@ mod engine_tests {
                 true,
                 false,
                 Some(remote),
+                None,
             )
         });
         let start = Instant::now();

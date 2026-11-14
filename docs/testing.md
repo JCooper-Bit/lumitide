@@ -21,4 +21,6 @@ The fixture was generated with:
 ffmpeg -f lavfi -i anullsrc=r=44100:cl=stereo -t 12 -c:a flac -map_metadata -1 silence.flac
 ```
 
-Live Tidal account tests remain opt-in. Mock requests verify paths, bodies, pagination, mixed video/track indices, and conditional edit headers; they cannot verify account permissions, current service availability, or individual album availability. Desktop palette parsers and live reload can be tested with generated JSON files; an actual Noctalia desktop is not required.
+Live Tidal account tests remain opt-in. Mock requests verify paths, bodies, pagination, mixed video/track indices, and conditional edit headers; they cannot verify account permissions, current service availability, or individual album availability.
+
+Preloading tests use local HTTP fixtures to check that the next track downloads before the current track ends, playback reuses that download, failed preloads can retry, and queue changes predict the correct successor.

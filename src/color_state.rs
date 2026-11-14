@@ -3,7 +3,7 @@ use crate::config;
 /// Centralised colour source — all UI components read from one instance
 /// so title, spectrum bars, and download bar always show identical colours.
 pub struct ColorState {
-    palette: Vec<(u8, u8, u8)>, // 3 dominant colours from the album cover
+    palette: Vec<(u8, u8, u8)>, // fixed red visualization accents
     offset: usize,
     active: bool, // true while a drop is running
 }

@@ -2,7 +2,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Paragraph, block::Title},
+    widgets::{block::Title, Block, Borders, Paragraph},
     Frame,
 };
 
@@ -38,13 +38,15 @@ pub fn render(frame: &mut Frame, state: &PanelState) {
     let right_col_w: u16 = 50;
 
     // rows: 1 top-pad + title + artist + album + [label] + time + empty + vis
-    let right_rows = 1 + 3
+    let right_rows = 1
+        + 3
         + if state.track_label.is_some() { 1 } else { 0 }
-        + 1 + 1
+        + 1
+        + 1
         + state.vis_lines.len() as u16;
     let cover_rows = state.cover_lines.len() as u16 + 1; // +1 top-pad
 
-    let dim = Style::new().fg(Color::DarkGray);
+    let dim = Style::new().fg(crate::styling::MUTED);
 
     // ── "? controls" hint pinned to terminal bottom-right ────────────────────
     // Hidden while a download is active so the two don't overlap
@@ -79,18 +81,22 @@ pub fn render(frame: &mut Frame, state: &PanelState) {
         let block_h = right_rows.max(cover_rows) + 2; // +2 borders
         let x = terminal.x + terminal.width.saturating_sub(block_w) / 2;
         let y = terminal.y + terminal.height.saturating_sub(block_h) / 2;
-        let area = Rect::new(x, y, block_w.min(terminal.width), block_h.min(terminal.height));
+        let area = Rect::new(
+            x,
+            y,
+            block_w.min(terminal.width),
+            block_h.min(terminal.height),
+        );
 
         let hint_text = if state.is_local {
             "← prev  Spc pause  → next  ↑↓ vol  q/Esc quit"
         } else {
             "← prev  Spc pause  → next  ↑↓ vol  d download  r radio  q/Esc quit"
         };
-        let controls = Title::from(Line::styled(hint_text, dim))
-            .alignment(Alignment::Center);
+        let controls = Title::from(Line::styled(hint_text, dim)).alignment(Alignment::Center);
         let outer = Block::default()
             .borders(Borders::ALL)
-            .border_style(dim)
+            .border_style(Style::default().fg(crate::styling::BORDER))
             .title(controls);
         let inner = outer.inner(area);
         frame.render_widget(outer, area);
@@ -101,7 +107,12 @@ pub fn render(frame: &mut Frame, state: &PanelState) {
         let content_h = right_rows.max(cover_rows);
         let x = terminal.x + terminal.width.saturating_sub(content_w) / 2;
         let y = terminal.y + terminal.height.saturating_sub(content_h) / 2;
-        Rect::new(x, y, content_w.min(terminal.width), content_h.min(terminal.height))
+        Rect::new(
+            x,
+            y,
+            content_w.min(terminal.width),
+            content_h.min(terminal.height),
+        )
     };
 
     // Two columns: cover | info+spectrum
@@ -118,15 +129,20 @@ pub fn render(frame: &mut Frame, state: &PanelState) {
 
     // ── Right: track info + visualisation ────────────────────────────────────
     let title_style = match state.bar_color {
-        Some((r, g, b)) => Style::new().fg(Color::Rgb(r, g, b)).add_modifier(Modifier::BOLD),
+        Some((r, g, b)) => Style::new()
+            .fg(Color::Rgb(r, g, b))
+            .add_modifier(Modifier::BOLD),
         None => Style::new().add_modifier(Modifier::BOLD),
     };
-    let dim = Style::new().fg(Color::DarkGray);
+    let dim = Style::new().fg(crate::styling::MUTED);
 
     let mut right: Vec<Line<'static>> = Vec::new();
 
     right.push(Line::raw(""));
-    right.push(Line::from(Span::styled(state.track_name.to_string(), title_style)));
+    right.push(Line::from(Span::styled(
+        state.track_name.to_string(),
+        title_style,
+    )));
     right.push(Line::from(Span::styled(state.artist_name.to_string(), dim)));
     right.push(Line::from(Span::styled(state.album_name.to_string(), dim)));
     if let Some(label) = state.track_label {
@@ -137,21 +153,21 @@ pub fn render(frame: &mut Frame, state: &PanelState) {
     let vol_pct = (state.volume * 100.0) as u32;
     let pause_str = if state.paused { "  ⏸" } else { "" };
     let time_str = fmt_time(state.elapsed);
-    let mut time_line: Vec<Span<'static>> = vec![
-        Span::styled(time_str, Style::new().add_modifier(Modifier::BOLD)),
-    ];
+    let mut time_line: Vec<Span<'static>> = vec![Span::styled(
+        time_str,
+        Style::new().add_modifier(Modifier::BOLD),
+    )];
     if state.total > 0.0 {
-        time_line.push(Span::styled(
-            format!(" / {}", fmt_time(state.total)),
-            dim,
-        ));
+        time_line.push(Span::styled(format!(" / {}", fmt_time(state.total)), dim));
     }
 
     if !state.dl_status.is_empty() && !state.dl_status.starts_with('⬇') {
         // Show status ("✓ Saved", "✓ Saving...", "✗ Error") in the info line
         let status_style = if state.dl_status.starts_with('✓') {
             match state.bar_color {
-                Some((r, g, b)) => Style::new().fg(Color::Rgb(r, g, b)).add_modifier(Modifier::BOLD),
+                Some((r, g, b)) => Style::new()
+                    .fg(Color::Rgb(r, g, b))
+                    .add_modifier(Modifier::BOLD),
                 None => Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
             }
         } else {
@@ -161,10 +177,7 @@ pub fn render(frame: &mut Frame, state: &PanelState) {
             format!("  vol {}%{}", vol_pct, pause_str),
             Style::new().add_modifier(Modifier::BOLD),
         ));
-        time_line.push(Span::styled(
-            format!("  {}", state.dl_status),
-            status_style,
-        ));
+        time_line.push(Span::styled(format!("  {}", state.dl_status), status_style));
     } else {
         time_line.push(Span::styled(
             format!("  vol {}%{}", vol_pct, pause_str),

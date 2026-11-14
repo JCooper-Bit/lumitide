@@ -1,6 +1,7 @@
 mod api;
 mod app;
 mod auth;
+mod buffering;
 mod color_state;
 mod config;
 mod cover;
@@ -11,9 +12,9 @@ mod panel;
 mod player;
 mod preview;
 mod spectrum;
+mod styling;
 #[cfg(test)]
 mod test_support;
-mod theme;
 mod utils;
 
 use std::sync::OnceLock;
